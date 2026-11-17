@@ -204,7 +204,8 @@ def plan(c, audio_f32, s, t, rev, final=False):
     if s == 'auto' or t == 'none' or s == t:
         return (None if s == 'auto' else s), t
     prior = t if (c.idx == 1 and rev) else s
-    lang = c.utt_lang
+    # re-detect every time on a GPU (cheap) and always on the final pass; only partials on a slow CPU reuse the result
+    lang = None if (final or dev == 'GPU') else c.utt_lang
     if lang is None and len(audio_f32) >= RATE * (0.5 if final else 0.8):
         try:
             a = audio_f32
@@ -213,7 +214,7 @@ def plan(c, audio_f32, s, t, rev, final=False):
                 a = a * min(0.5 / peak, 12.0)
             probs = dict(model.detect_language(a)[2])
             score = {s: probs.get(s, 0.0), t: probs.get(t, 0.0)}
-            score[prior] += 0.15
+            score[prior] += 0.08
             lang = max(score, key=score.get)
             c.utt_lang = lang
         except Exception as e:
