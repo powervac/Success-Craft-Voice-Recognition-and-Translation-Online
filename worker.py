@@ -113,12 +113,13 @@ class Chan:
         self.cents = []        # speaker centroids (sum of unit embeddings)
         self.last_spk = 0
         self.utt_lang = None   # language decided for the utterance in progress
+        self.last_lang = None  # language of the previous finished utterance
 
 
 chans = [Chan(0), Chan(1)]
 
 
-def plan(c, audio_f32, s, t, rev):
+def plan(c, audio_f32, s, t, rev, final=False):
     """Decide (language to recognize, translation target) for an utterance.
 
     With a concrete language pair (s, t) every utterance is recognized in whichever of the two languages
@@ -128,7 +129,7 @@ def plan(c, audio_f32, s, t, rev):
         return (None if s == 'auto' else s), t
     prior = t if (c.idx == 1 and rev) else s
     lang = c.utt_lang
-    if lang is None and len(audio_f32) >= RATE * 1.2:
+    if lang is None and len(audio_f32) >= RATE * (0.5 if final else 0.8):
         try:
             a = audio_f32
             peak = float(np.abs(a).max())
@@ -142,7 +143,8 @@ def plan(c, audio_f32, s, t, rev):
         except Exception as e:
             sys.stderr.write('language detection error: %r\n' % (e,))
     if lang is None:
-        lang = prior
+        # too short to detect: keep the language of the previous utterance on this channel
+        lang = c.last_lang or prior
     return lang, (t if lang == s else s)
 
 
@@ -269,13 +271,15 @@ def worker():
         text, det, spk = '', None, 0
         want, target = s, t
         try:
-            want, target = plan(c, audio, s, t, rev)
+            want, target = plan(c, audio, s, t, rev, is_final)
             text, det = transcribe(audio, is_final, want)
             if text:
                 spk = identify(c, audio, is_final)
         except Exception as e:
             sys.stderr.write('transcribe error: %r\n' % (e,))
         if is_final:
+            if want in (s, t):
+                c.last_lang = want
             c.utt_lang = None
         send('F' if is_final else 'P', c.idx, spk, want or det or '', text)
         try:
