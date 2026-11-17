@@ -438,7 +438,7 @@ static void SaveSettings() {
     }
     WritePrivateProfileStringW(L"app", L"spkmodel", g_spkWanted.c_str(), g_ini.c_str());
     put(L"micon", g_micOn);
-    put(L"sys", g_sysOn); put(L"rev", g_rev); put(L"echo", g_echo); put(L"diar", Checked(hMany)); put(L"sens", g_sens);
+    put(L"sys", g_sysOn); put(L"rev", g_rev); put(L"echo", g_echo); put(L"diar", Checked(hMany)); put(L"sens2", g_sens);
 }
 
 static bool Checked(HWND h) { return SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED; }
@@ -1087,7 +1087,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         SetCheck(hMicOn, geti(L"micon", 1));
         SetCheck(hSysOn, geti(L"sys", 0)); SetCheck(hRev, geti(L"rev", 1)); SetCheck(hEcho, geti(L"echo", 1));
         SetCheck(hMany, geti(L"diar", 0)); SetCheck(hOne, !geti(L"diar", 0));
-        SendMessageW(hSens, TBM_SETPOS, TRUE, geti(L"sens", 60));
+        SendMessageW(hSens, TBM_SETPOS, TRUE, geti(L"sens2", 60));
         UpdateFx(false);
         UpdateConv(false);
         wchar_t savedMic[256];

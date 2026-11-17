@@ -158,15 +158,17 @@ except Exception as e:
 # ---- speaker embedding models (sherpa-onnx), selectable from the UI ----
 SPK_BASE = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/'
 SPEAKER_MODELS = [   # id, label, file, size in MB
-    ('resnet34', 'ResNet34 - fast (default)', 'wespeaker_en_voxceleb_resnet34_LM.onnx', 25),
+    ('resnet34', 'ResNet34 - fast, recommended', 'wespeaker_en_voxceleb_resnet34_LM.onnx', 25),
     ('campp', 'CAM++ - accurate and light', 'wespeaker_en_voxceleb_CAM++_LM.onnx', 27),
-    ('resnet152', 'ResNet152 - more accurate', 'wespeaker_en_voxceleb_resnet152_LM.onnx', 75),
-    ('resnet293', 'ResNet293 - most accurate, slower', 'wespeaker_en_voxceleb_resnet293_LM.onnx', 109),
+    ('resnet152', 'ResNet152 - experimental', 'wespeaker_en_voxceleb_resnet152_LM.onnx', 75),
+    ('resnet293', 'ResNet293 - experimental, slow', 'wespeaker_en_voxceleb_resnet293_LM.onnx', 109),
     ('titanet', 'TitaNet Large (NVIDIA)', 'nemo_en_titanet_large.onnx', 96),
     ('campp_zhen', 'CAM++ Chinese + English', '3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx', 26),
 ]
 # the larger models score every pair of voices higher; their decision threshold is shifted accordingly
-SPK_SHIFT = {'resnet152': 0.05, 'resnet293': 0.08}
+# Cosine-similarity scale differs between the models; this is the clustering threshold that separated two voices on
+# real speech (movie dialogue) at the default sensitivity. The sensitivity slider moves it +-0.08 around that point.
+SPK_BASE_T = {'resnet34': 0.80, 'campp': 0.80, 'resnet152': 0.88, 'resnet293': 0.88, 'titanet': 0.80, 'campp_zhen': 0.80}
 extractor = None
 spk_id = None
 spk_lock = threading.Lock()
@@ -417,7 +419,7 @@ def identify(c, audio_f32, final, prev=None):
     if dur < 0.8:
         return fallback
     e = embed(audio_f32)
-    T = 0.60 + 0.20 * sens / 100.0 + SPK_SHIFT.get(spk_id, 0.0)
+    T = SPK_BASE_T.get(spk_id, 0.80) + 0.002 * (sens - 60)
     lab = cluster(c.embs + [e], T)
     mine = lab[-1]
     votes = [c.ids[j] for j in range(len(c.ids)) if lab[j] == mine]
