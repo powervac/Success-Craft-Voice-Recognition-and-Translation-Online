@@ -254,6 +254,8 @@ class Chan:
         self.embs = []         # voiceprints of the finished pieces of speech (unit vectors)
         self.ids = []          # speaker number given to each stored voiceprint
         self.nxt = 1           # next free speaker number
+        self.gcent = {}        # global speaker number -> sum of voiceprints (neural diarization path)
+        self.gnext = 1
         self.last_spk = 0
         self.utt_lang = None   # language decided for the utterance in progress
         self.last_lang = None  # language of the previous finished utterance
@@ -262,6 +264,7 @@ class Chan:
 
 def _reset_speakers(self):
     self.embs, self.ids, self.nxt = [], [], 1
+    self.gcent, self.gnext = {}, 1
 
 
 Chan.reset_speakers = _reset_speakers
@@ -337,7 +340,7 @@ def transcribe(audio_f32, final, lang):
     """Returns ([(text, start_s, end_s), ...], detected_language). Timestamps let us split a long utterance
     by speaker."""
     if len(audio_f32) < RATE * 0.3:
-        return [], None
+        return [], [], None
     audio = audio_f32
     peak = float(np.abs(audio).max())
     if 0.003 < peak < 0.3:          # quiet source (far speaker, low-volume call): lift it, capped gain
@@ -356,17 +359,19 @@ def transcribe(audio_f32, final, lang):
     # drop segments Whisper itself considers non-speech (it likes to invent "Thank you." on noise)
     short = len(audio_f32) < RATE * 2.5       # short clips are where Whisper hallucinates most
     nsp, lp = (0.45, -0.45) if short else (0.7, -0.7)
-    items = []
+    items, words = [], []
     for sg in segs:
         if sg.no_speech_prob > nsp and sg.avg_logprob < lp:
             continue
+        if final and getattr(sg, 'words', None):
+            words.extend((w.word, float(w.start), float(w.end)) for w in sg.words)
         if final and getattr(sg, 'words', None):
             items.extend(split_sentences(sg))
         else:
             txt = sg.text.strip()
             if txt:
                 items.append((txt, float(sg.start), float(sg.end)))
-    return items, info.language
+    return items, words, info.language
 
 
 def embed(audio_f32):
@@ -448,8 +453,150 @@ def span(audio, start, end):
     return audio[max(0, int((start - 0.1) * RATE)):int((end + 0.1) * RATE)]
 
 
-def make_runs(c, audio, items, final):
-    """Group the segments of an utterance into runs of the same speaker -> [(speaker, text)]."""
+SEG_URL = ('https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/'
+           'sherpa-onnx-pyannote-segmentation-3-0.tar.bz2')
+seg_path = os.path.join(ROOT, 'speaker', 'pyannote-segmentation-3-0.onnx')
+diarizer, diar_for, seg_busy = None, None, False
+
+
+def ensure_segmentation():
+    """Download the speaker-turn model (6 MB) once, with a progress bar."""
+    global seg_busy
+    if os.path.isfile(seg_path) or seg_busy:
+        return
+    seg_busy = True
+    try:
+        send('S', 'Downloading the speaker-turn detector (6 MB, one time only)...')
+        tgz = seg_path + '.tar.bz2'
+        dl_progress.download_file(SEG_URL, tgz, 'Speaker-turn detector', send)
+        import tarfile
+        with tarfile.open(tgz) as tf:
+            for m in tf.getmembers():
+                if m.name.endswith('model.onnx'):
+                    with open(seg_path, 'wb') as out_f:
+                        out_f.write(tf.extractfile(m).read())
+                    break
+        os.remove(tgz)
+        send('S', 'Speaker-turn detector ready.')
+    except Exception as e:
+        sys.stderr.write('segmentation model failed: %r' % (e,) + chr(10))
+        send('S', 'Could not download the speaker-turn detector: %s' % (e,))
+    finally:
+        seg_busy = False
+
+
+def get_diarizer():
+    global diarizer, diar_for
+    if diarizer is not None and diar_for == spk_id:
+        return diarizer
+    if extractor is None or not os.path.isfile(seg_path) or spk_id is None:
+        return None
+    import sherpa_onnx as so
+    cfg = so.OfflineSpeakerDiarizationConfig(
+        segmentation=so.OfflineSpeakerSegmentationModelConfig(
+            pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=seg_path), num_threads=2),
+        embedding=so.SpeakerEmbeddingExtractorConfig(model=spk_file(spk_id), num_threads=2),
+        clustering=so.FastClusteringConfig(num_clusters=-1, threshold=0.5),
+        min_duration_on=0.2, min_duration_off=0.3)
+    diarizer, diar_for = so.OfflineSpeakerDiarization(cfg), spk_id
+    return diarizer
+
+
+def unit(v):
+    return v / (np.linalg.norm(v) + 1e-9)
+
+
+def match_global(c, audio_f32):
+    """Live preview: which known voice does this audio sound like (0 if nothing is known yet)."""
+    if len(audio_f32) < RATE * 0.8 or not c.gcent:
+        return c.last_spk or 1
+    e = embed(audio_f32)
+    best = max(c.gcent, key=lambda g: float(e @ unit(c.gcent[g])))
+    return best if float(e @ unit(c.gcent[best])) >= SPK_BASE_T.get(spk_id, 0.80) - 0.08 else (c.last_spk or best)
+
+
+def snap_runs(runs):
+    """Word times are a little imprecise: move a turn boundary to the nearest sentence end (within 2-3 words)."""
+    ends = ('.', '?', '!', '…')
+    runs = [[g, t.split()] for g, t in runs]
+    for i in range(len(runs) - 1):
+        a, b = runs[i][1], runs[i + 1][1]
+        tail = a[-3:]
+        ks = [k for k, w in enumerate(tail[:-1]) if w.endswith(ends)]      # sentence end followed by 1-2 words
+        if ks:
+            cut = len(a) - len(tail) + ks[-1] + 1
+            runs[i][1], runs[i + 1][1] = a[:cut], a[cut:] + b
+            continue
+        head = b[:3]
+        ks = [k for k, w in enumerate(head[:-1]) if w.endswith(ends)]      # the previous speaker's last words
+        if ks and not a[-1].endswith(ends):
+            cut = ks[0] + 1
+            runs[i][1], runs[i + 1][1] = a + b[:cut], b[cut:]
+    return [(g, ' '.join(w)) for g, w in runs if w]
+
+
+def runs_by_diarization(c, audio, items, words):
+    """Split the utterance at speaker turns found by the neural segmentation and number the voices consistently."""
+    sd = get_diarizer()
+    if sd is None or len(audio) < RATE * 2.0:
+        return None
+    segs = [(r.start, r.end, r.speaker) for r in sd.process(audio).sort_by_start_time()]
+    if not segs:
+        return None
+    Tm = SPK_BASE_T.get(spk_id, 0.80) - 0.05       # same voice in two different utterances
+    # one voiceprint per local speaker of this utterance (all of its speech)
+    embs = {}
+    for ls in sorted(set(x[2] for x in segs)):
+        parts = [audio[int(a * RATE):int(b * RATE)] for a, b, sp in segs if sp == ls]
+        a = np.concatenate(parts)[:RATE * 12]
+        if len(a) >= RATE * 0.8:
+            embs[ls] = embed(a)
+    cand = sorted(((float(e @ unit(cent)), ls, g) for ls, e in embs.items() for g, cent in c.gcent.items()), reverse=True)
+    mapping, used = {}, set()
+    for sim, ls, g in cand:                        # one global number per local speaker, best matches first
+        if ls not in mapping and g not in used and sim >= Tm:
+            mapping[ls] = g
+            used.add(g)
+    for ls in sorted(embs, key=lambda k: sum(b - a for a, b, sp in segs if sp == k), reverse=True):
+        if ls not in mapping:
+            if c.gnext <= MAX_SPEAKERS:
+                mapping[ls] = c.gnext
+                c.gnext += 1
+            else:                                   # no free number: closest known voice
+                mapping[ls] = max(c.gcent, key=lambda g: float(embs[ls] @ unit(c.gcent[g])))
+            used.add(mapping[ls])
+    for ls, g in mapping.items():                   # learn
+        c.gcent[g] = c.gcent.get(g, 0) + embs[ls]
+    fallback = c.last_spk or 1
+
+    def speaker_at(t0, t1):
+        mid = (t0 + t1) / 2
+        best, dist = None, 1e9
+        for a, b, sp in segs:
+            d = 0.0 if a <= mid <= b else min(abs(mid - a), abs(mid - b))
+            if d < dist:
+                best, dist = sp, d
+        return mapping.get(best, fallback)
+
+    units = words if words else [(' ' + t, st, en) for t, st, en in items]
+    runs = []
+    for text, st, en in units:
+        g = speaker_at(st, en)
+        if runs and runs[-1][0] == g:
+            runs[-1] = (g, runs[-1][1] + text)
+        else:
+            runs.append((g, text))
+    runs = snap_runs([(g, t.strip()) for g, t in runs if t.strip()])
+    if runs:
+        c.last_spk = runs[-1][0]
+        sys.stderr.write('DIAR ch%d %s neural: %d turns, voices %s, known %d' % (
+            c.idx, spk_id, len(segs), sorted(set(g for g, _ in runs)), len(c.gcent)) + chr(10))
+        sys.stderr.flush()
+    return runs or None
+
+
+def make_runs(c, audio, items, final, words=None):
+    """Group the pieces of an utterance into runs of the same speaker -> [(speaker, text)]."""
     if not items:
         return []
     joined = ' '.join(t for t, _, _ in items)
@@ -457,8 +604,15 @@ def make_runs(c, audio, items, final):
         return [(0, joined)]
     if not final:                       # live preview: one line, speaker of the latest piece
         t, st, en = items[-1]
-        return [(identify(c, span(audio, st, en), False, c.last_spk), joined)]
-    runs, prev = [], None
+        a = span(audio, st, en)
+        return [(match_global(c, a) if c.gcent else identify(c, a, False, c.last_spk), joined)]
+    try:
+        runs = runs_by_diarization(c, audio, items, words)
+        if runs:
+            return runs
+    except Exception as e:
+        sys.stderr.write('neural diarization failed: %r' % (e,) + chr(10))
+    runs, prev = [], None               # fallback: voiceprints of the sentences
     for n, (t, st, en) in enumerate(items):
         c.dbg = None
         spk = identify(c, span(audio, st, en), True, prev)
@@ -531,8 +685,8 @@ def worker():
         want, target = s, t
         try:
             want, target = plan(c, audio, s, t, rev, is_final)
-            items, det = transcribe(audio, is_final, want)
-            runs = make_runs(c, audio, items, is_final)
+            items, words, det = transcribe(audio, is_final, want)
+            runs = make_runs(c, audio, items, is_final, words)
         except Exception as e:
             sys.stderr.write('transcribe error: %r\n' % (e,))
         if is_final:
@@ -597,6 +751,8 @@ try:
                 with cond:
                     src_lang, tgt_lang = parts[0], parts[1]
                     reverse, diarize = parts[2] == '1', parts[3] == '1'
+                if diarize and not os.path.isfile(seg_path):
+                    threading.Thread(target=ensure_segmentation, daemon=True).start()
                     try:
                         sens = max(0, min(100, int(parts[4])))
                     except ValueError:
