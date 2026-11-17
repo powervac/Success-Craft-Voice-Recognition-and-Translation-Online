@@ -42,6 +42,8 @@ Pick a microphone, choose the spoken language and the target language (for examp
 - **Always on top:** the window stays above all other windows and hides only when you minimize it.
 - **Save to disk:** writes both versions of the document, for example `Transcript_2026-11-17_17-11_en.txt` and `Transcript_2026-11-17_17-11_ru.txt` (UTF-8). **Copy** buttons place either panel on the clipboard.
 - All settings (microphone, languages, sliders, checkboxes) are remembered between runs.
+- **Self-installing:** on every start the app checks what is missing and installs it - Python (via winget, if none is found), the virtual environment, the Python packages from `requirements.txt` (only the missing ones; CUDA libraries only when an NVIDIA GPU is present) and the models. Downloads show a progress bar with percent, size and the estimated time left.
+- **Works without an NVIDIA GPU:** it falls back to the CPU and picks the lighter `small` recognition model automatically (override with `DICTATE_MODEL`). Expect a delay of a second or two on a CPU; translation runs on the CPU too.
 - 100% local: no cloud services, no API keys, no audio leaves your computer.
 
 ## How it works
@@ -59,7 +61,8 @@ Pick a microphone, choose the spoken language and the target language (for examp
 ```
 
 - `main.cpp` – the whole GUI and audio front end (Win32 API + WinMM, no third-party C++ libraries).
-- `worker.py` – hidden helper process started by the app. It loads both models once, receives audio, and streams back partial/final text and translations. Translation is done sentence by sentence (NLLB tends to drop sentences when fed a whole paragraph) with a small cache, so earlier sentences stay stable while the current one grows.
+- `dl_progress.py` – model download helpers that report percent / size / time left to the window.
+- `worker.py` – hidden helper process started by the app; on start it checks `requirements.txt` against what is installed and installs what is missing. It loads both models once, receives audio, and streams back partial/final text and translations. Translation is done sentence by sentence (NLLB tends to drop sentences when fed a whole paragraph) with a small cache, so earlier sentences stay stable while the current one grows.
 
 ## Requirements
 
@@ -78,12 +81,11 @@ Pick a microphone, choose the spoken language and the target language (for examp
 git clone https://github.com/powervac/Success-Craft-Voice-Recognition-and-Translation-Online.git
 cd Success-Craft-Voice-Recognition-and-Translation-Online
 
-.\setup.ps1          # creates .\venv, installs dependencies, downloads the models (~4.5 GB)
 .\build.bat          # compiles VoiceWindow.exe
-.\VoiceWindow.exe    # first start takes 15-30 s while the models load
+.\VoiceWindow.exe    # the first start installs / downloads whatever is missing (progress bar), then loads the models
 ```
 
-Use `.\setup.ps1 -Small` to download the lighter `medium` Whisper model instead of `large-v3` (and set `DICTATE_MODEL=medium`, see below).
+`.\setup.ps1` (creates `.\venv`, installs the dependencies and downloads the models up front, ~4.5 GB) is optional - `VoiceWindow.exe` performs the same steps itself on first start. Use `.\setup.ps1 -Small` to download the lighter `medium` Whisper model instead of `large-v3` (and set `DICTATE_MODEL=medium`, see below).
 
 When the status line says the model is loaded, choose a microphone and the languages, then press **Start**.
 
