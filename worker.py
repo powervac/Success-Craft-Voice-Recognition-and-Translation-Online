@@ -165,6 +165,8 @@ SPEAKER_MODELS = [   # id, label, file, size in MB
     ('titanet', 'TitaNet Large (NVIDIA)', 'nemo_en_titanet_large.onnx', 96),
     ('campp_zhen', 'CAM++ Chinese + English', '3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx', 26),
 ]
+# the larger models score every pair of voices higher; their decision threshold is shifted accordingly
+SPK_SHIFT = {'resnet152': 0.05, 'resnet293': 0.08}
 extractor = None
 spk_id = None
 spk_lock = threading.Lock()
@@ -303,8 +305,10 @@ def plan(c, audio_f32, s, t, rev, final=False):
 
 
 def transcribe(audio_f32, final, lang):
+    """Returns ([(text, start_s, end_s), ...], detected_language). Timestamps let us split a long utterance
+    by speaker."""
     if len(audio_f32) < RATE * 0.3:
-        return '', None
+        return [], None
     audio = audio_f32
     peak = float(np.abs(audio).max())
     if 0.003 < peak < 0.3:          # quiet source (far speaker, low-volume call): lift it, capped gain
@@ -317,13 +321,19 @@ def transcribe(audio_f32, final, lang):
         temperature=0.0,
         vad_filter=True,
         condition_on_previous_text=False,
-        without_timestamps=True,
+        without_timestamps=False,
     )
     # drop segments Whisper itself considers non-speech (it likes to invent "Thank you." on noise)
     short = len(audio_f32) < RATE * 2.5       # short clips are where Whisper hallucinates most
     nsp, lp = (0.45, -0.45) if short else (0.7, -0.7)
-    text = ' '.join(sg.text.strip() for sg in segs if not (sg.no_speech_prob > nsp and sg.avg_logprob < lp)).strip()
-    return text, info.language
+    items = []
+    for sg in segs:
+        if sg.no_speech_prob > nsp and sg.avg_logprob < lp:
+            continue
+        txt = sg.text.strip()
+        if txt:
+            items.append((txt, float(sg.start), float(sg.end)))
+    return items, info.language
 
 
 def embed(audio_f32):
@@ -334,40 +344,63 @@ def embed(audio_f32):
     return e / (np.linalg.norm(e) + 1e-9)
 
 
-def identify(c, audio_f32, final):
-    """Speaker number (1-based) inside a channel; 0 when speaker detection is off.
+def identify(c, audio_f32, final, prev=None):
+    """Speaker number (1-based) of one piece of speech inside a channel; 0 when speaker detection is off.
 
-    A new speaker is only created from a clearly long utterance (>= 2 s): short phrases such as "yes" or
-    "perfect" carry too little voice information and are attached to the closest / previous speaker."""
+    Short pieces carry too little voice information: below 1 s the previous speaker is kept. A new speaker is created
+    from a long piece (>= 2.5 s) that differs from every known voice, or from a shorter one (>= 1.5 s) that differs
+    clearly."""
     if not diarize or extractor is None:
         return 0
     dur = len(audio_f32) / RATE
-    if dur < 1.0:                                   # too short for a reliable voiceprint
-        return c.last_spk or 1
+    fallback = prev or c.last_spk or 1
+    if dur < 1.0:
+        return fallback
     e = embed(audio_f32)
     if not c.cents:
         if final:
             c.cents.append(e.copy())
-            c.last_spk = 1
         return 1
     sims = [float(e @ (v / (np.linalg.norm(v) + 1e-9))) for v in c.cents]
     k = int(np.argmax(sims))
-    thr = 0.55 + 0.30 * sens / 100.0
-    if dur < 2.5:
-        thr -= 0.06                                    # short phrases are noisier: lenient about "same voice"
-    if sims[k] >= thr:
+    thr = 0.55 + 0.30 * sens / 100.0 + SPK_SHIFT.get(spk_id, 0.0)
+    if sims[k] >= thr - (0.06 if dur < 2.5 else 0.0):
         spk = k + 1
         if final and dur >= 1.5:
             c.cents[k] = c.cents[k] + e                # running centroid
-    elif dur >= 2.5 and len(c.cents) < MAX_SPEAKERS:
+    elif len(c.cents) < MAX_SPEAKERS and (dur >= 2.5 or (dur >= 1.5 and sims[k] < thr - 0.12)):
         spk = len(c.cents) + 1
         if final:
             c.cents.append(e.copy())
     else:
-        spk = c.last_spk or (k + 1)
-    if final:
-        c.last_spk = spk
+        spk = k + 1 if sims[k] >= thr - 0.12 else fallback
     return spk
+
+
+def span(audio, start, end):
+    return audio[max(0, int((start - 0.1) * RATE)):int((end + 0.1) * RATE)]
+
+
+def make_runs(c, audio, items, final):
+    """Group the segments of an utterance into runs of the same speaker -> [(speaker, text)]."""
+    if not items:
+        return []
+    joined = ' '.join(t for t, _, _ in items)
+    if not diarize or extractor is None:
+        return [(0, joined)]
+    if not final:                       # live preview: one line, speaker of the latest piece
+        t, st, en = items[-1]
+        return [(identify(c, span(audio, st, en), False, c.last_spk), joined)]
+    runs, prev = [], None
+    for t, st, en in items:
+        spk = identify(c, span(audio, st, en), True, prev)
+        prev = spk
+        if runs and runs[-1][0] == spk:
+            runs[-1] = (spk, runs[-1][1] + ' ' + t)
+        else:
+            runs.append((spk, t))
+    c.last_spk = prev
+    return runs
 
 
 def translate(text, s, t, final):
@@ -422,26 +455,29 @@ def worker():
             c, raw, is_final = job
             s, t, rev = src_lang, tgt_lang, reverse
         audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        text, det, spk = '', None, 0
+        det, runs = None, []
         want, target = s, t
         try:
             want, target = plan(c, audio, s, t, rev, is_final)
-            text, det = transcribe(audio, is_final, want)
-            if text:
-                spk = identify(c, audio, is_final)
+            items, det = transcribe(audio, is_final, want)
+            runs = make_runs(c, audio, items, is_final)
         except Exception as e:
             sys.stderr.write('transcribe error: %r\n' % (e,))
         if is_final:
             if want in (s, t):
                 c.last_lang = want
             c.utt_lang = None
-        send('F' if is_final else 'P', c.idx, spk, want or det or '', text)
-        try:
-            tr = translate(text, want or det, target, is_final) if text else ''
-        except Exception as e:
-            sys.stderr.write('translate error: %r\n' % (e,))
-            tr = ''
-        send('U' if is_final else 'T', c.idx, spk, target if target != 'none' else '', tr)
+        if not runs:
+            runs = [(0, '')]
+        lang_out = want or det or ''
+        for spk, text in runs:
+            send('F' if is_final else 'P', c.idx, spk, lang_out, text)
+            try:
+                tr = translate(text, want or det, target, is_final) if text else ''
+            except Exception as e:
+                sys.stderr.write('translate error: %r\n' % (e,))
+                tr = ''
+            send('U' if is_final else 'T', c.idx, spk, target if target != 'none' else '', tr)
 
 
 try:
