@@ -4,9 +4,10 @@ stdin frames  : 1 byte type + uint32 LE length + payload
    'A' = channel byte + int16 mono 16 kHz audio   (channel 0 = microphone, 1 = system audio)
    'E' = channel byte                              (end of an utterance on that channel)
    'L' = "src|tgt|reverse|diarize|sensitivity"     (languages, options)
-   'R' = reset the known speakers
+   'R' = reset the known speakers, 'M' = switch the speaker model (model id)
    'Q' = quit
 stdout lines  : KIND \\t text \\n   for S (status), N (translation unavailable), V (speaker detection unavailable)
+                C = speaker-model catalog entry, M = active speaker model
                 KIND \\t channel \\t speaker \\t text \\n   for
                 P/F = partial/final recognized text, T/U = partial/final translation
 """
@@ -24,8 +25,6 @@ MODEL = os.environ.get('DICTATE_MODEL', 'large-v3')
 NLLB_REPO = 'OpenNMT/nllb-200-distilled-1.3B-ct2-int8'
 NLLB = {'ru': 'rus_Cyrl', 'en': 'eng_Latn', 'de': 'deu_Latn', 'fr': 'fra_Latn', 'es': 'spa_Latn',
         'uk': 'ukr_Cyrl', 'pl': 'pol_Latn', 'it': 'ita_Latn'}
-SPK_FILE = 'wespeaker_en_voxceleb_resnet34_LM.onnx'
-SPK_URL = ('https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/' + SPK_FILE)
 MAX_SPEAKERS = 6
 out = sys.stdout.buffer
 inp = sys.stdin.buffer
@@ -156,21 +155,82 @@ except Exception as e:
     translator = None
     send('N', 'Translation model unavailable: %s' % (e,))
 
-# ---- speaker embedding model (sherpa-onnx + WeSpeaker), optional ----
+# ---- speaker embedding models (sherpa-onnx), selectable from the UI ----
+SPK_BASE = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/'
+SPEAKER_MODELS = [   # id, label, file, size in MB
+    ('resnet34', 'ResNet34 - fast (default)', 'wespeaker_en_voxceleb_resnet34_LM.onnx', 25),
+    ('campp', 'CAM++ - accurate and light', 'wespeaker_en_voxceleb_CAM++_LM.onnx', 27),
+    ('resnet152', 'ResNet152 - more accurate', 'wespeaker_en_voxceleb_resnet152_LM.onnx', 75),
+    ('resnet293', 'ResNet293 - most accurate, slower', 'wespeaker_en_voxceleb_resnet293_LM.onnx', 109),
+    ('titanet', 'TitaNet Large (NVIDIA)', 'nemo_en_titanet_large.onnx', 96),
+    ('campp_zhen', 'CAM++ Chinese + English', '3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx', 26),
+]
 extractor = None
-try:
+spk_id = None
+spk_lock = threading.Lock()
+spk_loading, spk_pending = False, None
+import dl_progress
+
+
+def spk_file(mid):
+    entry = next(m for m in SPEAKER_MODELS if m[0] == mid)
+    return os.path.join(ROOT, 'speaker', entry[2])
+
+
+def send_catalog():
+    for i, (mid, label, fn, mb) in enumerate(SPEAKER_MODELS):
+        send('C', i, mid, label, mb, 1 if os.path.isfile(spk_file(mid)) else 0)
+
+
+def load_speaker(mid):
+    """Download (with progress) and activate a speaker-embedding model; centroids of the old model are dropped."""
+    global extractor, spk_id
+    entry = next((m for m in SPEAKER_MODELS if m[0] == mid), None)
+    if entry is None:
+        return
     import sherpa_onnx
-    spk_path = os.path.join(ROOT, 'speaker', SPK_FILE)
-    if not os.path.isfile(spk_path):
-        import dl_progress
-        send('S', 'Downloading the speaker model (one time only)...')
-        dl_progress.download_file(SPK_URL, spk_path, 'Speaker model', send)
-    extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
-        sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=spk_path, num_threads=2, provider='cpu'))
-except Exception as e:
-    sys.stderr.write('speaker detection unavailable: %r\n' % (e,))
-    extractor = None
-    send('V', 'Speaker detection unavailable: %s' % (e,))
+    path = spk_file(mid)
+    if not os.path.isfile(path):
+        send('S', 'Downloading the speaker model "%s" (%d MB, one time only)...' % (entry[1], entry[3]))
+        dl_progress.download_file(SPK_BASE + entry[2], path, 'Speaker model ' + entry[1].split(' -')[0], send)
+    new = sherpa_onnx.SpeakerEmbeddingExtractor(
+        sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=path, num_threads=2, provider='cpu'))
+    with cond:
+        extractor, spk_id = new, mid
+        for c in chans:
+            c.cents.clear()
+            c.last_spk = 0
+    send('M', mid)
+    send_catalog()
+
+
+def switch_speaker(mid):
+    """Switch the speaker model in the background (the audio keeps flowing meanwhile)."""
+    global spk_loading, spk_pending
+    with spk_lock:
+        if spk_loading:
+            spk_pending = mid
+            return
+        spk_loading = True
+
+    def run(m):
+        global spk_loading, spk_pending
+        while m:
+            try:
+                if m != spk_id:
+                    load_speaker(m)
+            except Exception as e:
+                sys.stderr.write('speaker model error: %r' % (e,) + chr(10))
+                send('D', -1, '')
+                send('S', 'Could not load the speaker model: %s' % (e,))
+                send('M', spk_id or '')
+            with spk_lock:
+                m, spk_pending = spk_pending, None
+                if not m:
+                    spk_loading = False
+
+    threading.Thread(target=run, args=(mid,), daemon=True).start()
+
 
 # ---- shared state ----
 src_lang, tgt_lang, reverse, diarize, sens = 'ru', 'none', True, False, 60
@@ -384,6 +444,17 @@ def worker():
         send('U' if is_final else 'T', c.idx, spk, target if target != 'none' else '', tr)
 
 
+try:
+    initial = os.environ.get('SPEAKER_MODEL') or 'resnet34'
+    if not any(m[0] == initial for m in SPEAKER_MODELS):
+        initial = 'resnet34'
+    load_speaker(initial)
+except Exception as e:
+    sys.stderr.write('speaker detection unavailable: %r' % (e,) + chr(10))
+    extractor = None
+    send('V', 'Speaker detection unavailable: %s' % (e,))
+    send_catalog()
+
 threading.Thread(target=worker, daemon=True).start()
 send('S', 'ready (%s)' % dev)
 
@@ -422,6 +493,8 @@ try:
                         sens = max(0, min(100, int(parts[4])))
                     except ValueError:
                         pass
+        elif t == 'M':
+            switch_speaker(payload.decode('utf-8', 'ignore'))
         elif t == 'R':
             with cond:
                 for c in chans:

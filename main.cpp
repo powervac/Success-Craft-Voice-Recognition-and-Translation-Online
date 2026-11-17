@@ -35,7 +35,7 @@
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
        ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
-       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON };
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL };
 enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
@@ -53,7 +53,10 @@ static std::atomic<long long> g_sysLastSpeechMs{0};   // for the speaker-echo fi
 static HWND hMain, hMicLbl, hMic, hLang, hStart, hClear, hCopy, hLevel, hLevel2, hStatus, hEdit;
 static HWND hGainLbl, hGain, hGainVal, hAgc, hNs, hNsStr, hNsVal, hBoost;
 static HWND hSysOn, hRev, hEcho, hOne, hMany, hSens, hSensVal;
-static HWND hSysLbl, hSysDev, hProg, hMicOn;
+static HWND hSysLbl, hSysDev, hProg, hMicOn, hSpkLbl, hSpkModel;
+struct SpkModel { std::wstring id, label; int mb = 0; bool present = false; };
+static std::vector<SpkModel> g_spk;             // catalog sent by the worker
+static std::wstring g_spkActive, g_spkWanted;   // model in use / model chosen in the UI
 static std::vector<std::wstring> g_sysIds;   // endpoint ids of the output devices listed in hSysDev (item 0 = default)
 static std::wstring g_sysIdSel;              // endpoint id used by the loopback thread ("" = default output)
 static HWND hSave, hLangLbl, hTgtLbl, hTgt, hSwap, hCopyTr, hEditTr, hCapSrc, hCapTr;
@@ -181,6 +184,7 @@ static bool StartWorker() {
     if (root.empty()) root = dir + L"\\data";
     CreateDirectoryW(root.c_str(), nullptr);
     SetEnvironmentVariableW(L"DICTATION_ROOT", root.c_str());   // models + temp files live here
+    SetEnvironmentVariableW(L"SPEAKER_MODEL", g_spkWanted.empty() ? nullptr : g_spkWanted.c_str());
     std::wstring cmd = L"\"" + py + L"\" -u \"" + dir + L"\\worker.py\"";
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
     cmdBuf.push_back(0);
@@ -401,6 +405,19 @@ static std::string CodeOf(HWND combo, const char* special) {
     return c;
 }
 
+static void RefreshSpkCombo() {
+    SendMessageW(hSpkModel, CB_RESETCONTENT, 0, 0);
+    int sel = -1;
+    for (size_t i = 0; i < g_spk.size(); i++) {
+        auto& m = g_spk[i];
+        std::wstring t = m.label + L"  (" + std::to_wstring(m.mb) + L" MB, " + (m.present ? L"installed" : L"will be downloaded") + L")";
+        SendMessageW(hSpkModel, CB_ADDSTRING, 0, (LPARAM)t.c_str());
+        if (m.id == (g_spkWanted.empty() ? g_spkActive : g_spkWanted)) sel = (int)i;
+    }
+    if (sel < 0 && !g_spk.empty()) sel = 0;
+    SendMessageW(hSpkModel, CB_SETCURSEL, sel, 0);
+}
+
 static bool Checked(HWND h);
 static void SaveSettings() {
     if (g_ini.empty()) return;
@@ -419,6 +436,7 @@ static void SaveSettings() {
         int sd = (int)SendMessageW(hSysDev, CB_GETCURSEL, 0, 0);
         WritePrivateProfileStringW(L"app", L"sysdev", (sd > 0 && sd - 1 < (int)g_sysIds.size()) ? g_sysIds[sd - 1].c_str() : L"", g_ini.c_str());
     }
+    WritePrivateProfileStringW(L"app", L"spkmodel", g_spkWanted.c_str(), g_ini.c_str());
     put(L"micon", g_micOn);
     put(L"sys", g_sysOn); put(L"rev", g_rev); put(L"echo", g_echo); put(L"diar", Checked(hMany)); put(L"sens", g_sens);
 }
@@ -454,6 +472,7 @@ static void UpdateConv(bool save) {
     wchar_t t[48];
     swprintf(t, 48, L"%d%%", g_sens.load()); SetWindowTextW(hSensVal, t);
     EnableWindow(hMic, g_micOn && !g_capturing);
+    EnableWindow(hSpkModel, g_diar && g_spkAvailable);
     EnableWindow(hRev, g_sysOn);
     EnableWindow(hEcho, g_sysOn);
     EnableWindow(hSens, g_diar);
@@ -803,6 +822,9 @@ static void Layout(int w, int h) {
     MoveWindow(hMany, m + S(155), y, S(210), rowH, TRUE);
     MoveWindow(hSens, m + S(380), y, S(240), rowH, TRUE);
     MoveWindow(hSensVal, m + S(626), y + S(4), S(80), rowH, TRUE);
+    y += rowH + S(2);
+    MoveWindow(hSpkLbl, m, y + S(4), lblW, rowH, TRUE);
+    MoveWindow(hSpkModel, m + lblW, y, w - 2 * m - lblW, S(300), TRUE);
     y += rowH + m;
     MoveWindow(hStatus, m, y, w - 2 * m, S(20), TRUE);
     MoveWindow(hProg, m, y + S(22), w - 2 * m, S(8), TRUE);   // download progress bar (shown only while downloading)
@@ -946,6 +968,8 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         hMicLbl = Mk(L"STATIC", L"Microphone:", 0, 0);
         hMic = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_MIC);
         hMicOn = Mk(L"BUTTON", L"Use microphone", BS_AUTOCHECKBOX | WS_TABSTOP, ID_MICON);
+        hSpkLbl = Mk(L"STATIC", L"Speaker model:", 0, 0);
+        hSpkModel = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_SPKMODEL);
         hSysLbl = Mk(L"STATIC", L"Other side from:", 0, 0);
         hSysDev = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_SYSDEV);
         hLangLbl = Mk(L"STATIC", L"Speech language:", 0, 0);
@@ -1055,6 +1079,11 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             for (size_t i = 0; sid[0] && i < g_sysIds.size(); i++)
                 if (g_sysIds[i] == sid) SendMessageW(hSysDev, CB_SETCURSEL, i + 1, 0);
         }
+        {
+            wchar_t sm[64];
+            GetPrivateProfileStringW(L"app", L"spkmodel", L"", sm, 64, g_ini.c_str());
+            g_spkWanted = sm;
+        }
         SetCheck(hMicOn, geti(L"micon", 1));
         SetCheck(hSysOn, geti(L"sys", 0)); SetCheck(hRev, geti(L"rev", 1)); SetCheck(hEcho, geti(L"echo", 1));
         SetCheck(hMany, geti(L"diar", 0)); SetCheck(hOne, !geti(L"diar", 0));
@@ -1076,7 +1105,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         if ((HWND)lp == hSens) UpdateConv(LOWORD(wp) == TB_ENDTRACK);
         return 0;
     case WM_SIZE: Layout(LOWORD(lp), HIWORD(lp)); return 0;
-    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(860), S(740)}; return 0; }
+    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(860), S(780)}; return 0; }
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_START:
@@ -1111,6 +1140,18 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateUi();
             return 0;
         }
+        case ID_SPKMODEL:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                int sel = (int)SendMessageW(hSpkModel, CB_GETCURSEL, 0, 0);
+                if (sel >= 0 && sel < (int)g_spk.size() && g_spk[sel].id != g_spkActive) {
+                    g_spkWanted = g_spk[sel].id;
+                    SaveSettings();
+                    std::string id(g_spkWanted.begin(), g_spkWanted.end());
+                    SendFrame('M', id.data(), (uint32_t)id.size());
+                    SetStatus(L"Switching the speaker model...");
+                }
+            }
+            return 0;
         case ID_SYSDEV:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 SaveSettings();
@@ -1190,6 +1231,27 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             EnableWindow(hTgt, FALSE); EnableWindow(hSwap, FALSE);
             SaveSettings();
             break;
+        case 'C': {  // speaker-model catalog entry: index \t id \t label \t MB \t present
+            std::vector<std::wstring> f;
+            size_t st = 0, q;
+            while ((q = m->text.find(L'\t', st)) != std::wstring::npos) { f.push_back(m->text.substr(st, q - st)); st = q + 1; }
+            f.push_back(m->text.substr(st));
+            if (f.size() >= 5) {
+                if (f[0] == L"0") g_spk.clear();
+                SpkModel sm;
+                sm.id = f[1]; sm.label = f[2]; sm.mb = _wtoi(f[3].c_str()); sm.present = f[4] == L"1";
+                g_spk.push_back(sm);
+                if (g_spk.size() == 6 || (int)g_spk.size() >= 1) RefreshSpkCombo();
+            }
+            break;
+        }
+        case 'M':  // the speaker model that is now active
+            g_spkActive = m->text;
+            for (auto& sm : g_spk) if (sm.id == m->text) sm.present = true;
+            if (g_spkWanted.empty()) g_spkWanted = m->text;
+            RefreshSpkCombo();
+            if (!m->text.empty()) { ShowWindow(hProg, SW_HIDE); }
+            break;
         case 'D':  // download / install progress (percent < 0 hides the bar)
             if (m->spk < 0) { ShowWindow(hProg, SW_HIDE); break; }
             ShowWindow(hProg, SW_SHOW);
@@ -1264,7 +1326,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     HDC dc = GetDC(nullptr); int dpi = GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(nullptr, dc);
     // WS_EX_TOPMOST: always above other windows; it leaves only when minimized with the "-" button
     HWND w = CreateWindowExW(WS_EX_TOPMOST, L"VoiceWindow", L"Voice Recognition and Translation", WS_OVERLAPPEDWINDOW,
-                             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(1000, dpi, 96),
+                             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(1040, dpi, 96),
                              nullptr, nullptr, hInst, nullptr);
     ShowWindow(w, show);
     MSG m;
