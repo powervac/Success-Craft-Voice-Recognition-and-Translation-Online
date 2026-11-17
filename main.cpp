@@ -35,7 +35,7 @@
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
        ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
-       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG };
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON };
 enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
@@ -46,14 +46,14 @@ static const int NLANGS = sizeof(LANGS) / sizeof(LANGS[0]);
 
 // ---- settings shared with the audio threads ----
 static std::atomic<int> g_gainDb{0}, g_ns{1}, g_nsStr{50}, g_agc{1}, g_boost{0};
-static std::atomic<int> g_sysOn{0}, g_rev{1}, g_echo{0}, g_diar{0}, g_sens{60};
+static std::atomic<int> g_sysOn{0}, g_rev{1}, g_echo{0}, g_diar{0}, g_sens{60}, g_micOn{1};
 static std::atomic<long long> g_sysLastSpeechMs{0};   // for the speaker-echo filter
 
 // ---- window handles and state ----
 static HWND hMain, hMicLbl, hMic, hLang, hStart, hClear, hCopy, hLevel, hLevel2, hStatus, hEdit;
 static HWND hGainLbl, hGain, hGainVal, hAgc, hNs, hNsStr, hNsVal, hBoost;
 static HWND hSysOn, hRev, hEcho, hOne, hMany, hSens, hSensVal;
-static HWND hSysLbl, hSysDev, hProg;
+static HWND hSysLbl, hSysDev, hProg, hMicOn;
 static std::vector<std::wstring> g_sysIds;   // endpoint ids of the output devices listed in hSysDev (item 0 = default)
 static std::wstring g_sysIdSel;              // endpoint id used by the loopback thread ("" = default output)
 static HWND hSave, hLangLbl, hTgtLbl, hTgt, hSwap, hCopyTr, hEditTr, hCapSrc, hCapTr;
@@ -419,6 +419,7 @@ static void SaveSettings() {
         int sd = (int)SendMessageW(hSysDev, CB_GETCURSEL, 0, 0);
         WritePrivateProfileStringW(L"app", L"sysdev", (sd > 0 && sd - 1 < (int)g_sysIds.size()) ? g_sysIds[sd - 1].c_str() : L"", g_ini.c_str());
     }
+    put(L"micon", g_micOn);
     put(L"sys", g_sysOn); put(L"rev", g_rev); put(L"echo", g_echo); put(L"diar", Checked(hMany)); put(L"sens", g_sens);
 }
 
@@ -444,6 +445,7 @@ static void UpdateFx(bool save) {
     if (save) SaveSettings();
 }
 static void UpdateConv(bool save) {
+    g_micOn = Checked(hMicOn);
     g_sysOn = Checked(hSysOn);
     g_rev = Checked(hRev);
     g_echo = Checked(hEcho);
@@ -451,6 +453,7 @@ static void UpdateConv(bool save) {
     g_sens = (int)SendMessageW(hSens, TBM_GETPOS, 0, 0);
     wchar_t t[48];
     swprintf(t, 48, L"%d%%", g_sens.load()); SetWindowTextW(hSensVal, t);
+    EnableWindow(hMic, g_micOn && !g_capturing);
     EnableWindow(hRev, g_sysOn);
     EnableWindow(hEcho, g_sysOn);
     EnableWindow(hSens, g_diar);
@@ -697,37 +700,47 @@ static void StopLoopback() {
 }
 
 static bool StartCapture(UINT dev) {
-    WAVEFORMATEX wf{WAVE_FORMAT_PCM, 1, 16000, 32000, 2, 16, 0};
-    g_waveEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    MMRESULT r = waveInOpen(&g_wi, dev, &wf, (DWORD_PTR)g_waveEv, 0, CALLBACK_EVENT);
-    if (r != MMSYSERR_NOERROR) { CloseHandle(g_waveEv); g_wi = nullptr; return false; }
+    if (!g_micOn && !g_sysOn) return false;          // nothing to listen to
     g_ch[0] = Channel(0);
-    for (int i = 0; i < NB; i++) {
-        g_hdr[i] = WAVEHDR{};
-        g_hdr[i].lpData = (LPSTR)g_bufs[i];
-        g_hdr[i].dwBufferLength = CHUNK * 2;
-        waveInPrepareHeader(g_wi, &g_hdr[i], sizeof(WAVEHDR));
-        waveInAddBuffer(g_wi, &g_hdr[i], sizeof(WAVEHDR));
+    if (g_micOn) {                                   // with the microphone switched off it is not even opened
+        WAVEFORMATEX wf{WAVE_FORMAT_PCM, 1, 16000, 32000, 2, 16, 0};
+        g_waveEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (waveInOpen(&g_wi, dev, &wf, (DWORD_PTR)g_waveEv, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR) {
+            CloseHandle(g_waveEv);
+            g_wi = nullptr;
+            if (!g_sysOn) return false;              // no microphone and no system audio
+        }
     }
     g_capturing = true;
-    waveInStart(g_wi);
-    g_capture = std::thread(MicLoop);
+    if (g_wi) {
+        for (int i = 0; i < NB; i++) {
+            g_hdr[i] = WAVEHDR{};
+            g_hdr[i].lpData = (LPSTR)g_bufs[i];
+            g_hdr[i].dwBufferLength = CHUNK * 2;
+            waveInPrepareHeader(g_wi, &g_hdr[i], sizeof(WAVEHDR));
+            waveInAddBuffer(g_wi, &g_hdr[i], sizeof(WAVEHDR));
+        }
+        waveInStart(g_wi);
+        g_capture = std::thread(MicLoop);
+    }
     if (g_sysOn) StartLoopback();
     return true;
 }
 
 static void StopCapture() {
-    if (!g_wi) return;
+    if (!g_capturing) return;
     g_capturing = false;
     StopLoopback();
-    SetEvent(g_waveEv);
-    if (g_capture.joinable()) g_capture.join();
-    waveInStop(g_wi);
-    waveInReset(g_wi);
-    for (int i = 0; i < NB; i++) waveInUnprepareHeader(g_wi, &g_hdr[i], sizeof(WAVEHDR));
-    waveInClose(g_wi);
-    g_wi = nullptr;
-    CloseHandle(g_waveEv);
+    if (g_wi) {
+        SetEvent(g_waveEv);
+        if (g_capture.joinable()) g_capture.join();
+        waveInStop(g_wi);
+        waveInReset(g_wi);
+        for (int i = 0; i < NB; i++) waveInUnprepareHeader(g_wi, &g_hdr[i], sizeof(WAVEHDR));
+        waveInClose(g_wi);
+        g_wi = nullptr;
+        CloseHandle(g_waveEv);
+    }
     SendMessageW(hLevel, PBM_SETPOS, 0, 0);
 }
 
@@ -735,7 +748,7 @@ static void UpdateUi() {
     bool on = g_capturing;
     SetWindowTextW(hStart, on ? L"Stop" : L"Start");
     EnableWindow(hStart, g_ready);
-    EnableWindow(hMic, !on);
+    EnableWindow(hMic, !on && g_micOn);
 }
 
 static void Layout(int w, int h) {
@@ -743,7 +756,8 @@ static void Layout(int w, int h) {
     int lblW = S(130);
     // row 1: microphone
     MoveWindow(hMicLbl, m, y + S(4), lblW, rowH, TRUE);
-    MoveWindow(hMic, m + lblW, y, w - 2 * m - lblW, S(300), TRUE);
+    MoveWindow(hMic, m + lblW, y, w - 2 * m - lblW - S(170), S(300), TRUE);
+    MoveWindow(hMicOn, w - m - S(160), y, S(160), rowH, TRUE);
     y += rowH + m;
     // row 1b: which output device carries the other side (sound card, HDMI, headphones, virtual cable)
     MoveWindow(hSysLbl, m, y + S(4), lblW, rowH, TRUE);
@@ -931,6 +945,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         hMicLbl = Mk(L"STATIC", L"Microphone:", 0, 0);
         hMic = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_MIC);
+        hMicOn = Mk(L"BUTTON", L"Use microphone", BS_AUTOCHECKBOX | WS_TABSTOP, ID_MICON);
         hSysLbl = Mk(L"STATIC", L"Other side from:", 0, 0);
         hSysDev = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_SYSDEV);
         hLangLbl = Mk(L"STATIC", L"Speech language:", 0, 0);
@@ -1040,6 +1055,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             for (size_t i = 0; sid[0] && i < g_sysIds.size(); i++)
                 if (g_sysIds[i] == sid) SendMessageW(hSysDev, CB_SETCURSEL, i + 1, 0);
         }
+        SetCheck(hMicOn, geti(L"micon", 1));
         SetCheck(hSysOn, geti(L"sys", 0)); SetCheck(hRev, geti(L"rev", 1)); SetCheck(hEcho, geti(L"echo", 1));
         SetCheck(hMany, geti(L"diar", 0)); SetCheck(hOne, !geti(L"diar", 0));
         SendMessageW(hSens, TBM_SETPOS, TRUE, geti(L"sens", 60));
@@ -1071,7 +1087,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                 int sel = (int)SendMessageW(hMic, CB_GETCURSEL, 0, 0);
                 UINT dev = (UINT)SendMessageW(hMic, CB_GETITEMDATA, sel, 0);
                 if (StartCapture(dev)) SetStatus(g_sysOn ? L"Listening to you and to the other side..." : L"Listening... speak now.");
-                else SetStatus(L"Could not open the microphone.");
+                else SetStatus(g_micOn ? L"Could not open the microphone." : L"Nothing to capture: enable the microphone or the system audio.");
             }
             UpdateUi();
             return 0;
@@ -1083,6 +1099,18 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_SAVE: SaveDocuments(hw); return 0;
         case ID_NS: case ID_AGC: case ID_BOOST: UpdateFx(true); return 0;
         case ID_REV: case ID_ECHO: case ID_ONE: case ID_MANY: UpdateConv(true); return 0;
+        case ID_MICON: {   // switch the microphone on/off (e.g. to avoid pick-up of loudspeakers)
+            UpdateConv(true);
+            if (g_capturing) {
+                int sel = (int)SendMessageW(hMic, CB_GETCURSEL, 0, 0);
+                UINT dev = (UINT)SendMessageW(hMic, CB_GETITEMDATA, sel, 0);
+                StopCapture();
+                if (StartCapture(dev)) SetStatus(g_micOn ? L"Microphone on." : L"Microphone off - listening to the system audio only.");
+                else SetStatus(L"Nothing to capture: enable the microphone or the system audio.");
+            }
+            UpdateUi();
+            return 0;
+        }
         case ID_SYSDEV:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 SaveSettings();
