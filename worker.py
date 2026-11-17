@@ -200,7 +200,7 @@ def load_speaker(mid):
     with cond:
         extractor, spk_id = new, mid
         for c in chans:
-            c.cents.clear()
+            c.reset_speakers()
             c.last_spk = 0
     send('M', mid)
     send_catalog()
@@ -249,13 +249,20 @@ class Chan:
         self.last_len = 0
         self.final = False
         self.last_time = 0.0
-        self.cents = []        # speaker centroids (sum of unit embeddings)
+        self.embs = []         # voiceprints of the finished pieces of speech (unit vectors)
+        self.ids = []          # speaker number given to each stored voiceprint
+        self.nxt = 1           # next free speaker number
         self.last_spk = 0
         self.utt_lang = None   # language decided for the utterance in progress
         self.last_lang = None  # language of the previous finished utterance
         self.dbg = None        # (duration, similarities) of the last identification, for the diagnostic log
 
 
+def _reset_speakers(self):
+    self.embs, self.ids, self.nxt = [], [], 1
+
+
+Chan.reset_speakers = _reset_speakers
 chans = [Chan(0), Chan(1)]
 
 
@@ -305,6 +312,25 @@ def plan(c, audio_f32, s, t, rev, final=False):
     return lang, (t if lang == s else s)
 
 
+def split_sentences(sg):
+    """Cut a Whisper segment into sentences (end mark or a pause > 0.8 s) using the word timestamps."""
+    out, cur, st, last_end = [], [], None, 0.0
+    for w in sg.words:
+        if cur and w.start - last_end > 0.8:
+            out.append((''.join(cur).strip(), st, last_end))
+            cur, st = [], None
+        if st is None:
+            st = float(w.start)
+        cur.append(w.word)
+        last_end = float(w.end)
+        if w.word.rstrip().endswith(('.', '?', '!', '…')):
+            out.append((''.join(cur).strip(), st, last_end))
+            cur, st = [], None
+    if cur:
+        out.append((''.join(cur).strip(), st, last_end))
+    return [o for o in out if o[0]]
+
+
 def transcribe(audio_f32, final, lang):
     """Returns ([(text, start_s, end_s), ...], detected_language). Timestamps let us split a long utterance
     by speaker."""
@@ -323,6 +349,7 @@ def transcribe(audio_f32, final, lang):
         vad_filter=True,
         condition_on_previous_text=False,
         without_timestamps=False,
+        word_timestamps=final,          # word times let us cut a segment into sentences (for speaker detection)
     )
     # drop segments Whisper itself considers non-speech (it likes to invent "Thank you." on noise)
     short = len(audio_f32) < RATE * 2.5       # short clips are where Whisper hallucinates most
@@ -331,9 +358,12 @@ def transcribe(audio_f32, final, lang):
     for sg in segs:
         if sg.no_speech_prob > nsp and sg.avg_logprob < lp:
             continue
-        txt = sg.text.strip()
-        if txt:
-            items.append((txt, float(sg.start), float(sg.end)))
+        if final and getattr(sg, 'words', None):
+            items.extend(split_sentences(sg))
+        else:
+            txt = sg.text.strip()
+            if txt:
+                items.append((txt, float(sg.start), float(sg.end)))
     return items, info.language
 
 
@@ -345,38 +375,71 @@ def embed(audio_f32):
     return e / (np.linalg.norm(e) + 1e-9)
 
 
+def cluster(vecs, T):
+    """Average-linkage agglomerative clustering of unit vectors: merge while the best average similarity >= T.
+    Returns a cluster label per vector."""
+    X = np.stack(vecs)
+    S = X @ X.T
+    np.fill_diagonal(S, -1.0)
+    size = np.ones(len(X))
+    members = {i: [i] for i in range(len(X))}
+    while len(members) > 1:
+        idx = list(members)
+        sub = S[np.ix_(idx, idx)]
+        a, b = np.unravel_index(int(np.argmax(sub)), sub.shape)
+        if sub[a, b] < T:
+            break
+        ia, ib = idx[a], idx[b]
+        sa, sb = size[ia], size[ib]
+        S[ia, :] = (sa * S[ia, :] + sb * S[ib, :]) / (sa + sb)
+        S[:, ia] = S[ia, :]
+        S[ia, ia] = -1.0
+        size[ia] = sa + sb
+        members[ia] += members.pop(ib)
+    lab = [0] * len(X)
+    for k, mem in enumerate(members.values()):
+        for i in mem:
+            lab[i] = k
+    return lab
+
+
 def identify(c, audio_f32, final, prev=None):
     """Speaker number (1-based) of one piece of speech inside a channel; 0 when speaker detection is off.
 
-    Short pieces carry too little voice information: below 1 s the previous speaker is kept. A new speaker is created
-    from a long piece (>= 2.5 s) that differs from every known voice, or from a shorter one (>= 1.5 s) that differs
-    clearly."""
+    Every finished piece keeps its voiceprint; a new piece is clustered together with all of them (average
+    linkage), so one odd short piece cannot drag a "voice centre" around. The piece takes the number most of its
+    cluster mates already have, or a new number when it has no mates. Pieces under 0.8 s are too short to tell and
+    keep the previous speaker."""
     if not diarize or extractor is None:
         return 0
     dur = len(audio_f32) / RATE
     fallback = prev or c.last_spk or 1
-    if dur < 1.0:
+    if dur < 0.8:
         return fallback
     e = embed(audio_f32)
-    if not c.cents:
-        if final:
-            c.cents.append(e.copy())
-        return 1
-    sims = [float(e @ (v / (np.linalg.norm(v) + 1e-9))) for v in c.cents]
-    c.dbg = (dur, sims)
-    k = int(np.argmax(sims))
-    thr = 0.55 + 0.30 * sens / 100.0 + SPK_SHIFT.get(spk_id, 0.0)
-    if sims[k] >= thr - (0.06 if dur < 2.5 else 0.0):
-        spk = k + 1
-        if final and dur >= 1.5:
-            c.cents[k] = c.cents[k] + e                # running centroid
-    elif len(c.cents) < MAX_SPEAKERS and (dur >= 2.5 or (dur >= 1.5 and sims[k] < thr - 0.12)):
-        spk = len(c.cents) + 1
-        if final:
-            c.cents.append(e.copy())
-    else:
-        spk = k + 1 if sims[k] >= thr - 0.12 else fallback
-    return spk
+    T = 0.60 + 0.20 * sens / 100.0 + SPK_SHIFT.get(spk_id, 0.0)
+    lab = cluster(c.embs + [e], T)
+    mine = lab[-1]
+    votes = [c.ids[j] for j in range(len(c.ids)) if lab[j] == mine]
+    new = False
+    if votes:
+        sid = max(set(votes), key=votes.count)
+    elif c.nxt <= MAX_SPEAKERS and (dur >= 1.3 or not c.embs):   # a very short piece never creates a new voice
+        sid, new = c.nxt, True
+    else:                                           # no free number: closest existing voice
+        sims = {}
+        for j, v in enumerate(c.embs):
+            sims.setdefault(c.ids[j], []).append(float(e @ v))
+        sid = max(sims, key=lambda k: float(np.mean(sims[k]))) if sims else fallback
+    c.dbg = (dur, T, sid, len(c.embs))
+    if final:
+        c.embs.append(e)
+        c.ids.append(sid)
+        if new:
+            c.nxt += 1
+        if len(c.embs) > 80:                        # keep the clustering cheap in very long sessions
+            c.embs, c.ids = c.embs[-80:], c.ids[-80:]
+    return sid
 
 
 def span(audio, start, end):
@@ -398,10 +461,9 @@ def make_runs(c, audio, items, final):
         c.dbg = None
         spk = identify(c, span(audio, st, en), True, prev)
         prev = spk
-        if c.dbg:   # diagnostic log (worker.log): how similar this piece is to each known voice
-            sys.stderr.write('DIAR ch%d %s thr=%.2f piece %d dur=%.1fs sims=%s -> speaker %d | %s' % (
-                c.idx, spk_id, 0.55 + 0.30 * sens / 100.0 + SPK_SHIFT.get(spk_id, 0.0), n, c.dbg[0],
-                ['%.2f' % x for x in c.dbg[1]], spk, t[:40]) + chr(10))
+        if c.dbg:   # diagnostic log (worker.log)
+            sys.stderr.write('DIAR ch%d %s T=%.2f piece %d dur=%.1fs known=%d -> speaker %d | %s' % (
+                c.idx, spk_id, c.dbg[1], n, c.dbg[0], c.dbg[3], spk, t[:40]) + chr(10))
             sys.stderr.flush()
         if runs and runs[-1][0] == spk:
             runs[-1] = (spk, runs[-1][1] + ' ' + t)
@@ -542,7 +604,7 @@ try:
         elif t == 'R':
             with cond:
                 for c in chans:
-                    c.cents.clear()
+                    c.reset_speakers()
                     c.last_spk = 0
         elif t == 'Q':
             break
