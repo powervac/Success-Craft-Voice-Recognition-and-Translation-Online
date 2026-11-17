@@ -117,22 +117,23 @@ send('S', 'Loading the recognition model %s...' % MODEL)
 import numpy as np
 from faster_whisper import WhisperModel
 
+model_ref = MODEL            # becomes a local folder once the model is on disk: loading then never touches the network
 try:
     import dl_progress
     from faster_whisper.utils import _MODELS
     if MODEL in _MODELS:
-        dl_progress.fetch(_MODELS[MODEL], os.path.join(ROOT, 'hf'), 'Recognition model %s' % MODEL, send,
+        model_ref = dl_progress.fetch(_MODELS[MODEL], os.path.join(ROOT, 'hf'), 'Recognition model %s' % MODEL, send,
                           allow_patterns=['config.json', 'preprocessor_config.json', 'model.bin', 'tokenizer.json', 'vocabulary.*'])
 except Exception as e:
     sys.stderr.write('model pre-download failed: %r\n' % (e,))
 
 try:
-    model = WhisperModel(MODEL, device='cuda', compute_type='float16', download_root=os.path.join(ROOT, 'hf'))
+    model = WhisperModel(model_ref, device='cuda', compute_type='float16', download_root=os.path.join(ROOT, 'hf'))
     dev = 'GPU'
 except Exception as e:
     sys.stderr.write('GPU failed: %r\n' % (e,))
     send('S', 'GPU unavailable, loading on the CPU...')
-    model = WhisperModel(MODEL, device='cpu', compute_type='int8', download_root=os.path.join(ROOT, 'hf'))
+    model = WhisperModel(model_ref, device='cpu', compute_type='int8', download_root=os.path.join(ROOT, 'hf'))
     dev = 'CPU'
 
 # ---- translation engine (NLLB-200 via CTranslate2), optional ----
