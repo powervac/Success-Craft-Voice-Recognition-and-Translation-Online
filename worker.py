@@ -253,6 +253,7 @@ class Chan:
         self.last_spk = 0
         self.utt_lang = None   # language decided for the utterance in progress
         self.last_lang = None  # language of the previous finished utterance
+        self.dbg = None        # (duration, similarities) of the last identification, for the diagnostic log
 
 
 chans = [Chan(0), Chan(1)]
@@ -362,6 +363,7 @@ def identify(c, audio_f32, final, prev=None):
             c.cents.append(e.copy())
         return 1
     sims = [float(e @ (v / (np.linalg.norm(v) + 1e-9))) for v in c.cents]
+    c.dbg = (dur, sims)
     k = int(np.argmax(sims))
     thr = 0.55 + 0.30 * sens / 100.0 + SPK_SHIFT.get(spk_id, 0.0)
     if sims[k] >= thr - (0.06 if dur < 2.5 else 0.0):
@@ -392,9 +394,15 @@ def make_runs(c, audio, items, final):
         t, st, en = items[-1]
         return [(identify(c, span(audio, st, en), False, c.last_spk), joined)]
     runs, prev = [], None
-    for t, st, en in items:
+    for n, (t, st, en) in enumerate(items):
+        c.dbg = None
         spk = identify(c, span(audio, st, en), True, prev)
         prev = spk
+        if c.dbg:   # diagnostic log (worker.log): how similar this piece is to each known voice
+            sys.stderr.write('DIAR ch%d %s thr=%.2f piece %d dur=%.1fs sims=%s -> speaker %d | %s' % (
+                c.idx, spk_id, 0.55 + 0.30 * sens / 100.0 + SPK_SHIFT.get(spk_id, 0.0), n, c.dbg[0],
+                ['%.2f' % x for x in c.dbg[1]], spk, t[:40]) + chr(10))
+            sys.stderr.flush()
         if runs and runs[-1][0] == spk:
             runs[-1] = (spk, runs[-1][1] + ' ' + t)
         else:
