@@ -1,4 +1,4 @@
-# Success Craft Voice Recognition and Translation Online
+﻿# Success Craft Voice Recognition and Translation Online
 
 A small native Windows app that listens to a microphone, **recognizes speech on the fly** and **translates it into another language as text** – fully offline, on your own machine.
 
@@ -31,7 +31,8 @@ Pick a microphone, choose the spoken language and the target language (for examp
 - **Conversation mode:** tick *Capture the other side (system audio)* and the app listens to two sources at once - your microphone (**You**) and whatever your PC plays, e.g. a call in Zoom, Teams or Discord (**Them**, captured with WASAPI loopback). Every line goes on its own row with a coloured speaker label, in both panels. Each utterance is recognized in whichever of the two chosen languages is actually spoken and translated into the other one.
 - **One or several interlocutors:** *One interlocutor* labels everything from the other side as "Them". *Several (detect voices)* tells voices apart with a speaker-embedding model (WeSpeaker via sherpa-onnx) and labels them "Them", "Them 2", "Them 3"...; the *sensitivity* slider controls how readily a new voice is created.
 - **Echo filter:** with loudspeakers your microphone also hears the other side. *Speakers mode (echo filter)* mutes the microphone while the other side is audible, so nothing is duplicated; turn it off when you use headphones.
-- **Microphone selection** from the list of Windows input devices.
+- **Microphone selection** from the list of Windows input devices - this also lists sound-card inputs such as *Line In* or *Stereo Mix* (enable them in Windows Sound settings if they are hidden).
+- **Sound-card output as a source:** *Other side from* lets you pick which output device to listen to (sound card, HDMI, headphones, a virtual audio cable), not only the default one.
 - **Sound controls**, applied before recognition:
   - gain slider, from -10 dB to +30 dB;
   - automatic gain control (AGC) that levels quiet and loud speakers;

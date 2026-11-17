@@ -35,7 +35,7 @@
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
        ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
-       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2 };
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV };
 enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
@@ -53,6 +53,9 @@ static std::atomic<long long> g_sysLastSpeechMs{0};   // for the speaker-echo fi
 static HWND hMain, hMicLbl, hMic, hLang, hStart, hClear, hCopy, hLevel, hLevel2, hStatus, hEdit;
 static HWND hGainLbl, hGain, hGainVal, hAgc, hNs, hNsStr, hNsVal, hBoost;
 static HWND hSysOn, hRev, hEcho, hOne, hMany, hSens, hSensVal;
+static HWND hSysLbl, hSysDev;
+static std::vector<std::wstring> g_sysIds;   // endpoint ids of the output devices listed in hSysDev (item 0 = default)
+static std::wstring g_sysIdSel;              // endpoint id used by the loopback thread ("" = default output)
 static HWND hSave, hLangLbl, hTgtLbl, hTgt, hSwap, hCopyTr, hEditTr, hCapSrc, hCapTr;
 static HFONT hFont, hBigFont, hBoldFont;
 static bool g_trAvailable = true, g_spkAvailable = true;
@@ -318,6 +321,10 @@ static void SaveSettings() {
     put(L"tgt", SendMessageW(hTgt, CB_GETCURSEL, 0, 0));
     put(L"gain", g_gainDb + 10);
     put(L"ns", g_ns); put(L"nsv", g_nsStr); put(L"agc", g_agc); put(L"boost", g_boost);
+    {
+        int sd = (int)SendMessageW(hSysDev, CB_GETCURSEL, 0, 0);
+        WritePrivateProfileStringW(L"app", L"sysdev", (sd > 0 && sd - 1 < (int)g_sysIds.size()) ? g_sysIds[sd - 1].c_str() : L"", g_ini.c_str());
+    }
     put(L"sys", g_sysOn); put(L"rev", g_rev); put(L"echo", g_echo); put(L"diar", Checked(hMany)); put(L"sens", g_sens);
 }
 
@@ -509,7 +516,9 @@ static void LoopbackLoop() {
     auto fail = [](const wchar_t* msg) { PostMessageW(hMain, WM_SYSERR, 0, (LPARAM) new std::wstring(msg)); };
     do {
         if (FAILED(CoCreateInstance(G_CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, G_IID_IMMDeviceEnumerator, (void**)&en))) { fail(L"audio device enumerator"); break; }
-        if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev))) { fail(L"no default output device"); break; }
+        HRESULT hrd = g_sysIdSel.empty() ? en->GetDefaultAudioEndpoint(eRender, eConsole, &dev)
+                                         : en->GetDevice(g_sysIdSel.c_str(), &dev);
+        if (FAILED(hrd)) { fail(L"the selected output device is not available"); break; }
         if (FAILED(dev->Activate(G_IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&ac))) { fail(L"cannot open the output device"); break; }
         if (FAILED(ac->GetMixFormat(&wfx))) { fail(L"cannot read the output format"); break; }
         if (FAILED(ac->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10000000, 0, wfx, nullptr))) { fail(L"loopback capture is not available"); break; }
@@ -582,6 +591,8 @@ static void LoopbackLoop() {
 static void StartLoopback() {
     if (g_loop.joinable()) { g_sysRun = false; g_loop.join(); }
     g_ch[1] = Channel(1);
+    int sel = (int)SendMessageW(hSysDev, CB_GETCURSEL, 0, 0);
+    g_sysIdSel = (sel > 0 && sel - 1 < (int)g_sysIds.size()) ? g_sysIds[sel - 1] : L"";
     g_sysRun = true;
     g_loop = std::thread(LoopbackLoop);
 }
@@ -639,6 +650,10 @@ static void Layout(int w, int h) {
     // row 1: microphone
     MoveWindow(hMicLbl, m, y + S(4), lblW, rowH, TRUE);
     MoveWindow(hMic, m + lblW, y, w - 2 * m - lblW, S(300), TRUE);
+    y += rowH + m;
+    // row 1b: which output device carries the other side (sound card, HDMI, headphones, virtual cable)
+    MoveWindow(hSysLbl, m, y + S(4), lblW, rowH, TRUE);
+    MoveWindow(hSysDev, m + lblW, y, w - 2 * m - lblW, S(300), TRUE);
     y += rowH + m;
     // row 2: speech language <-> translation language
     int cw = S(150), sw = S(40), x = m;
@@ -757,6 +772,43 @@ static void SaveDocuments(HWND hw) {
     SetStatus(ok ? L"Saved: " + saved : L"Could not save the file.");
 }
 
+static void FillSysDevices() {
+    SendMessageW(hSysDev, CB_RESETCONTENT, 0, 0);
+    g_sysIds.clear();
+    SendMessageW(hSysDev, CB_ADDSTRING, 0, (LPARAM)L"Default output device");
+    IMMDeviceEnumerator* en = nullptr;
+    if (SUCCEEDED(CoCreateInstance(G_CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, G_IID_IMMDeviceEnumerator, (void**)&en))) {
+        IMMDeviceCollection* col = nullptr;
+        UINT n = 0;
+        if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col)) && SUCCEEDED(col->GetCount(&n))) {
+            static const PROPERTYKEY KEY_NAME = {{0xA45C254E, 0xDF1C, 0x4EFD, {0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0}}, 14};
+            for (UINT i = 0; i < n; i++) {
+                IMMDevice* d = nullptr;
+                if (FAILED(col->Item(i, &d))) continue;
+                LPWSTR id = nullptr;
+                std::wstring name = L"(unnamed device)";
+                if (SUCCEEDED(d->GetId(&id))) {
+                    IPropertyStore* ps = nullptr;
+                    if (SUCCEEDED(d->OpenPropertyStore(STGM_READ, &ps))) {
+                        PROPVARIANT v;
+                        PropVariantInit(&v);
+                        if (SUCCEEDED(ps->GetValue(KEY_NAME, &v)) && v.vt == VT_LPWSTR && v.pwszVal) name = v.pwszVal;
+                        PropVariantClear(&v);
+                        ps->Release();
+                    }
+                    g_sysIds.push_back(id);
+                    SendMessageW(hSysDev, CB_ADDSTRING, 0, (LPARAM)name.c_str());
+                    CoTaskMemFree(id);
+                }
+                d->Release();
+            }
+        }
+        if (col) col->Release();
+        en->Release();
+    }
+    SendMessageW(hSysDev, CB_SETCURSEL, 0, 0);
+}
+
 static void SetCheck(HWND h, bool on) { SendMessageW(h, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0); }
 
 static void StyleRich(HWND e, COLORREF bg) {
@@ -784,6 +836,8 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         hMicLbl = Mk(L"STATIC", L"Microphone:", 0, 0);
         hMic = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_MIC);
+        hSysLbl = Mk(L"STATIC", L"Other side from:", 0, 0);
+        hSysDev = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_SYSDEV);
         hLangLbl = Mk(L"STATIC", L"Speech language:", 0, 0);
         hLang = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_LANG);
         hSwap = Mk(L"BUTTON", L"⇄", BS_PUSHBUTTON | WS_TABSTOP, ID_SWAP);
@@ -880,6 +934,14 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hGain, TBM_SETPOS, TRUE, geti(L"gain", 10) - 10);
         SendMessageW(hNsStr, TBM_SETPOS, TRUE, geti(L"nsv", 50));
         SetCheck(hNs, geti(L"ns", 1)); SetCheck(hAgc, geti(L"agc", 1)); SetCheck(hBoost, geti(L"boost", 0));
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        FillSysDevices();
+        {
+            wchar_t sid[512];
+            GetPrivateProfileStringW(L"app", L"sysdev", L"", sid, 512, g_ini.c_str());
+            for (size_t i = 0; sid[0] && i < g_sysIds.size(); i++)
+                if (g_sysIds[i] == sid) SendMessageW(hSysDev, CB_SETCURSEL, i + 1, 0);
+        }
         SetCheck(hSysOn, geti(L"sys", 0)); SetCheck(hRev, geti(L"rev", 1)); SetCheck(hEcho, geti(L"echo", 1));
         SetCheck(hMany, geti(L"diar", 0)); SetCheck(hOne, !geti(L"diar", 0));
         SendMessageW(hSens, TBM_SETPOS, TRUE, geti(L"sens", 60));
@@ -900,7 +962,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         if ((HWND)lp == hSens) UpdateConv(LOWORD(wp) == TB_ENDTRACK);
         return 0;
     case WM_SIZE: Layout(LOWORD(lp), HIWORD(lp)); return 0;
-    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(860), S(700)}; return 0; }
+    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(860), S(740)}; return 0; }
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_START:
@@ -923,6 +985,12 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_SAVE: SaveDocuments(hw); return 0;
         case ID_NS: case ID_AGC: case ID_BOOST: UpdateFx(true); return 0;
         case ID_REV: case ID_ECHO: case ID_ONE: case ID_MANY: UpdateConv(true); return 0;
+        case ID_SYSDEV:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                SaveSettings();
+                if (g_capturing && g_sysOn) StartLoopback();
+            }
+            return 0;
         case ID_SYS:
             UpdateConv(true);
             if (g_capturing) { if (g_sysOn) StartLoopback(); else StopLoopback(); }
@@ -1063,7 +1131,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     HDC dc = GetDC(nullptr); int dpi = GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(nullptr, dc);
     // WS_EX_TOPMOST: always above other windows; it leaves only when minimized with the "-" button
     HWND w = CreateWindowExW(WS_EX_TOPMOST, L"VoiceWindow", L"Voice Recognition and Translation", WS_OVERLAPPEDWINDOW,
-                             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(960, dpi, 96),
+                             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(1000, dpi, 96),
                              nullptr, nullptr, hInst, nullptr);
     ShowWindow(w, show);
     MSG m;
