@@ -330,6 +330,8 @@ class Chan:
         self.last_spk = 0
         self.utt_lang = None   # language decided for the utterance in progress
         self.last_lang = None  # language of the previous finished utterance
+        self.prev_sents = []   # sentences of the previous live pass (a sentence is final once it repeats)
+        self.prompt = ''       # last recognized text of this channel, given to Whisper as context
         self.dbg = None        # (duration, similarities) of the last identification, for the diagnostic log
 
 
@@ -407,7 +409,7 @@ def split_sentences(sg):
     return [o for o in out if o[0]]
 
 
-def transcribe(audio_f32, final, lang):
+def transcribe(audio_f32, final, lang, prompt=None):
     """Returns ([(text, start_s, end_s), ...], detected_language). Timestamps let us split a long utterance
     by speaker."""
     if len(audio_f32) < RATE * 0.3:
@@ -425,7 +427,8 @@ def transcribe(audio_f32, final, lang):
         vad_filter=True,
         condition_on_previous_text=False,
         without_timestamps=False,
-        word_timestamps=final,          # word times let us cut a segment into sentences (for speaker detection)
+        word_timestamps=True,           # word times: cut finished sentences, assign words to speaker turns
+        initial_prompt=prompt or None,  # the previous text of this channel helps with names and terms
     )
     # drop segments Whisper itself considers non-speech (it likes to invent "Thank you." on noise)
     short = len(audio_f32) < RATE * 2.5       # short clips are where Whisper hallucinates most
@@ -434,9 +437,8 @@ def transcribe(audio_f32, final, lang):
     for sg in segs:
         if sg.no_speech_prob > nsp and sg.avg_logprob < lp:
             continue
-        if final and getattr(sg, 'words', None):
+        if getattr(sg, 'words', None):
             words.extend((w.word, float(w.start), float(w.end)) for w in sg.words)
-        if final and getattr(sg, 'words', None):
             items.extend(split_sentences(sg))
         else:
             txt = sg.text.strip()
@@ -587,26 +589,21 @@ def match_global(c, audio_f32):
 
 
 def snap_runs(runs):
-    """Word times are a little imprecise: move a turn boundary to the nearest sentence end (within 2-3 words)."""
+    """A turn boundary must not fall inside a sentence (word times are imprecise): the unfinished sentence at the end of
+    a run moves to the run that continues it."""
     ends = ('.', '?', '!', '…')
     runs = [[g, t.split()] for g, t in runs]
     for i in range(len(runs) - 1):
-        a, b = runs[i][1], runs[i + 1][1]
-        tail = a[-3:]
-        ks = [k for k, w in enumerate(tail[:-1]) if w.endswith(ends)]      # sentence end followed by 1-2 words
-        if ks:
-            cut = len(a) - len(tail) + ks[-1] + 1
-            runs[i][1], runs[i + 1][1] = a[:cut], a[cut:] + b
-            continue
-        head = b[:3]
-        ks = [k for k, w in enumerate(head[:-1]) if w.endswith(ends)]      # the previous speaker's last words
-        if ks and not a[-1].endswith(ends):
-            cut = ks[0] + 1
-            runs[i][1], runs[i + 1][1] = a + b[:cut], b[cut:]
+        a = runs[i][1]
+        e = max([k for k, w in enumerate(a) if w.endswith(ends)], default=-1)
+        frag = a[e + 1:]
+        if frag and len(frag) <= 4:
+            runs[i][1] = a[:e + 1]
+            runs[i + 1][1] = frag + runs[i + 1][1]
     return [(g, ' '.join(w)) for g, w in runs if w]
 
 
-def runs_by_diarization(c, audio, items, words):
+def runs_by_diarization(c, audio, items, words, until=None):
     """Split the utterance at speaker turns found by the neural segmentation and number the voices consistently."""
     sd = get_diarizer()
     if sd is None or len(audio) < RATE * 2.0:
@@ -650,6 +647,8 @@ def runs_by_diarization(c, audio, items, words):
         return mapping.get(best, fallback)
 
     units = words if words else [(' ' + t, st, en) for t, st, en in items]
+    if until is not None:
+        units = [u for u in units if (u[1] + u[2]) / 2 < until]
     runs = []
     for text, st, en in units:
         g = speaker_at(st, en)
@@ -666,6 +665,43 @@ def runs_by_diarization(c, audio, items, words):
     return runs or None
 
 
+def assign_by_registry(c, audio, items, final):
+    """Fallback when the neural turn detector cannot be used: match each sentence to the known voices. A new voice is
+    only created from a clearly long piece (>= 2.5 s); short pieces join the closest known voice."""
+    Tm = SPK_BASE_T.get(spk_id, 0.80) - 0.05
+    runs, prev = [], None
+    for t, st, en in items:
+        a = span(audio, st, en)
+        dur = len(a) / RATE
+        if dur < 0.8:
+            g = prev or c.last_spk or 1
+        else:
+            e = embed(a)
+            if not c.gcent:
+                g = 1
+                c.gcent[1] = e.copy()
+                c.gnext = 2
+            else:
+                best = max(c.gcent, key=lambda k: float(e @ unit(c.gcent[k])))
+                sim = float(e @ unit(c.gcent[best]))
+                if sim >= Tm or dur < 2.5 or c.gnext > MAX_SPEAKERS:
+                    g = best
+                    if sim >= Tm and dur >= 1.5:
+                        c.gcent[g] = c.gcent[g] + e
+                else:
+                    g = c.gnext
+                    c.gnext += 1
+                    c.gcent[g] = e.copy()
+        prev = g
+        if runs and runs[-1][0] == g:
+            runs[-1] = (g, runs[-1][1] + ' ' + t)
+        else:
+            runs.append((g, t))
+    if prev:
+        c.last_spk = prev
+    return runs
+
+
 def make_runs(c, audio, items, final, words=None):
     """Group the pieces of an utterance into runs of the same speaker -> [(speaker, text)]."""
     if not items:
@@ -676,28 +712,14 @@ def make_runs(c, audio, items, final, words=None):
     if not final:                       # live preview: one line, speaker of the latest piece
         t, st, en = items[-1]
         a = span(audio, st, en)
-        return [(match_global(c, a) if c.gcent else identify(c, a, False, c.last_spk), joined)]
+        return [(match_global(c, a), joined)]
     try:
         runs = runs_by_diarization(c, audio, items, words)
         if runs:
             return runs
     except Exception as e:
         sys.stderr.write('neural diarization failed: %r' % (e,) + chr(10))
-    runs, prev = [], None               # fallback: voiceprints of the sentences
-    for n, (t, st, en) in enumerate(items):
-        c.dbg = None
-        spk = identify(c, span(audio, st, en), True, prev)
-        prev = spk
-        if c.dbg:   # diagnostic log (worker.log)
-            sys.stderr.write('DIAR ch%d %s T=%.2f piece %d dur=%.1fs known=%d -> speaker %d | %s' % (
-                c.idx, spk_id, c.dbg[1], n, c.dbg[0], c.dbg[3], spk, t[:40]) + chr(10))
-            sys.stderr.flush()
-        if runs and runs[-1][0] == spk:
-            runs[-1] = (spk, runs[-1][1] + ' ' + t)
-        else:
-            runs.append((spk, t))
-    c.last_spk = prev
-    return runs
+    return assign_by_registry(c, audio, items, True)
 
 
 def translate(text, s, t, final):
@@ -750,6 +772,69 @@ def pick():
     return None
 
 
+ENDS = ('.', '?', '!', '\u2026')
+
+
+def norm(t):
+    return re.sub(r'[^\w\s]', '', t.lower()).strip()
+
+
+def emit(c, runs, final, want, det, target):
+    """Send runs to the window. A finished run is cut into one line per sentence (each with its translation)."""
+    lang_out = want or det or ''
+    for spk, text in runs:
+        parts = [x for x in re.split(r'(?<=[.!?\u2026])\s+', text) if x.strip()] if final else [text]
+        for part in (parts or ['']):
+            send('F' if final else 'P', c.idx, spk, lang_out, part)
+            try:
+                tr = translate(part, want or det, target, final) if part else ''
+            except Exception as e:
+                sys.stderr.write('translate error: %r' % (e,) + chr(10))
+                tr = ''
+            send('U' if final else 'T', c.idx, spk, target if target != 'none' else '', tr)
+        if final and text:
+            c.prompt = (c.prompt + ' ' + text)[-220:]
+
+
+def stream_commit(c, audio, items, words, want, det, target):
+    """Live pass: sentences that are complete and unchanged since the previous pass are finalized right now and their
+    audio is cut from the buffer, so the text keeps flowing instead of waiting for a pause in the speech."""
+    dur = len(audio) / RATE
+    cur = [norm(t) for t, _, _ in items]
+    prev = c.prev_sents
+    k = 0
+    while k < len(cur) - 1 and k < len(prev) and cur[k] == prev[k]:   # never the last (still growing) sentence
+        k += 1
+    n = 0
+    for i in range(k):
+        t, st, en = items[i]
+        if (t.rstrip().endswith(ENDS) and en <= dur - 0.8) or (dur > 14.0 and en <= dur - 4.0):
+            n = i + 1
+        else:
+            break
+    c.prev_sents = cur
+    if n == 0:
+        return items, words
+    cut = (items[n - 1][2] + items[n][1]) / 2.0
+    cut = min(max(cut, items[n - 1][2]), items[n][1])
+    head_words = [w for w in words if (w[1] + w[2]) / 2 < cut]
+    runs = None
+    if diarize and extractor is not None:
+        try:
+            runs = runs_by_diarization(c, audio, items, words, until=cut)   # whole context, committed part only
+        except Exception as e:
+            sys.stderr.write('neural diarization failed: %r' % (e,) + chr(10))
+    if not runs:
+        runs = make_runs(c, audio[:int(cut * RATE)], items[:n], True, head_words)
+    emit(c, runs, True, want, det, target)
+    nb = int(cut * RATE) * 2
+    with cond:                                    # drop the committed audio; new audio keeps arriving at the end
+        del c.buf[:nb]
+        c.last_len = max(0, c.last_len - nb)
+    c.prev_sents = []
+    return items[n:], [w for w in words if (w[1] + w[2]) / 2 >= cut]
+
+
 def worker():
     while True:
         with cond:
@@ -766,25 +851,18 @@ def worker():
         want, target = s, t
         try:
             want, target = plan(c, audio, s, t, rev, is_final)
-            items, words, det = transcribe(audio, is_final, want)
+            items, words, det = transcribe(audio, is_final, want, c.prompt)
+            if not is_final:
+                items, words = stream_commit(c, audio, items, words, want, det, target)
             runs = make_runs(c, audio, items, is_final, words)
         except Exception as e:
-            sys.stderr.write('transcribe error: %r\n' % (e,))
+            sys.stderr.write('transcribe error: %r' % (e,) + chr(10))
         if is_final:
             if want in (s, t):
                 c.last_lang = want
             c.utt_lang = None
-        if not runs:
-            runs = [(0, '')]
-        lang_out = want or det or ''
-        for spk, text in runs:
-            send('F' if is_final else 'P', c.idx, spk, lang_out, text)
-            try:
-                tr = translate(text, want or det, target, is_final) if text else ''
-            except Exception as e:
-                sys.stderr.write('translate error: %r\n' % (e,))
-                tr = ''
-            send('U' if is_final else 'T', c.idx, spk, target if target != 'none' else '', tr)
+            c.prev_sents = []
+        emit(c, runs or [(0, '')], is_final, want, det, target)
 
 
 try:
