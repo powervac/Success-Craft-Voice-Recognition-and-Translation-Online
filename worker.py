@@ -195,33 +195,49 @@ class Chan:
 chans = [Chan(0), Chan(1)]
 
 
+def choose_lang(c, probs, s, t, prior, dur):
+    """Pick one of the two languages from Whisper's language probabilities, without flapping.
+
+    Forcing the wrong language makes Whisper *translate* the speech instead of transcribing it, so the choice is
+    conservative: if neither language is clearly heard (noise, music) keep the previous one, and switch to the
+    other language only when the evidence is strong."""
+    ps, pt = probs.get(s, 0.0), probs.get(t, 0.0)
+    tot = ps + pt
+    cur = c.last_lang
+    if tot < 0.25:                                   # not clearly either of the two languages
+        return cur or prior
+    q = {s: ps / tot, t: pt / tot}
+    if cur is None:
+        return max(q, key=q.get)
+    other = t if cur == s else s
+    if q[other] >= 0.85 and (dur >= 1.5 or q[other] >= 0.97):
+        return other
+    return cur
+
+
 def plan(c, audio_f32, s, t, rev, final=False):
     """Decide (language to recognize, translation target) for an utterance.
 
     With a concrete language pair (s, t) every utterance is recognized in whichever of the two languages
-    is actually spoken, and translated into the other one. The microphone leans to `s`; the other side
-    leans to `t` when `rev` is set. Speech language "auto" or no translation falls back to the simple rules."""
+    is actually spoken, and translated into the other one. Speech language "auto" or no translation falls
+    back to the simple rules."""
     if s == 'auto' or t == 'none' or s == t:
         return (None if s == 'auto' else s), t
     prior = t if (c.idx == 1 and rev) else s
-    # re-detect every time on a GPU (cheap) and always on the final pass; only partials on a slow CPU reuse the result
-    lang = None if (final or dev == 'GPU') else c.utt_lang
-    if lang is None and len(audio_f32) >= RATE * (0.5 if final else 0.8):
+    dur = len(audio_f32) / RATE
+    lang = None
+    if dur >= (0.5 if final else 0.8):
         try:
             a = audio_f32
             peak = float(np.abs(a).max())
             if 0.003 < peak < 0.3:
                 a = a * min(0.5 / peak, 12.0)
             probs = dict(model.detect_language(a)[2])
-            score = {s: probs.get(s, 0.0), t: probs.get(t, 0.0)}
-            score[prior] += 0.08
-            lang = max(score, key=score.get)
-            c.utt_lang = lang
+            lang = choose_lang(c, probs, s, t, prior, dur)
         except Exception as e:
             sys.stderr.write('language detection error: %r\n' % (e,))
     if lang is None:
-        # too short to detect: keep the language of the previous utterance on this channel
-        lang = c.last_lang or prior
+        lang = c.last_lang or prior                  # too short to detect: keep the previous language
     return lang, (t if lang == s else s)
 
 
