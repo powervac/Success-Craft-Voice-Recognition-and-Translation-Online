@@ -19,11 +19,6 @@ os.environ.setdefault('TMP', os.path.join(ROOT, 'tmp'))
 os.environ.setdefault('TEMP', os.path.join(ROOT, 'tmp'))
 os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
 
-site = os.path.join(sys.prefix, 'Lib', 'site-packages')
-for d in glob.glob(os.path.join(site, 'nvidia', '*', 'bin')):
-    os.add_dll_directory(d)
-    os.environ['PATH'] = d + os.pathsep + os.environ['PATH']
-
 RATE = 16000
 MODEL = os.environ.get('DICTATE_MODEL', 'large-v3')
 NLLB_REPO = 'OpenNMT/nllb-200-distilled-1.3B-ct2-int8'
@@ -44,9 +39,92 @@ def send(*fields):
         out.flush()
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def has_nvidia():
+    import shutil
+    return bool(shutil.which('nvidia-smi')) or os.path.isfile(
+        os.path.join(os.environ.get('SystemRoot', 'C:/Windows'), 'System32', 'nvidia-smi.exe'))
+
+
+if not os.environ.get('DICTATE_MODEL'):
+    MODEL = 'large-v3' if has_nvidia() else 'small'   # large-v3 is too slow for live use on a CPU
+
+
+def ensure_deps():
+    """Compare requirements.txt with what is installed and pip-install only what is missing."""
+    import importlib.metadata as md
+    import subprocess
+    req = os.path.join(HERE, 'requirements.txt')
+    if not os.path.isfile(req):
+        return
+    nvidia = has_nvidia()
+    missing = []
+    for line in open(req, encoding='utf-8'):
+        spec = line.split('#')[0].strip()
+        if not spec:
+            continue
+        name = re.split(r'[<>=!~\[ ;]', spec, maxsplit=1)[0]
+        if name.lower().startswith('nvidia-') and not nvidia:
+            continue                      # CUDA libraries are pointless without an NVIDIA GPU
+        try:
+            md.version(name)
+        except md.PackageNotFoundError:
+            missing.append(spec)
+    if not missing:
+        return
+    send('S', 'Installing missing Python packages (%s)...' % ', '.join(re.split(r'[<>=!~\[ ;]', m, maxsplit=1)[0] for m in missing))
+    cmd = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--progress-bar', 'raw'] + missing
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                         errors='replace', creationflags=0x08000000)   # CREATE_NO_WINDOW
+    cur, t0, last = '', time.time(), 0.0
+    for l in p.stdout:
+        l = l.strip()
+        if not l:
+            continue
+        m = re.match(r'Progress (\d+) of (\d+)', l)
+        if m:
+            done, total = int(m.group(1)), int(m.group(2))
+            if total and time.time() - last > 0.3:
+                last = time.time()
+                pct = min(100, done * 100 // total)
+                send('D', pct, 'Installing packages - %s: %d%% (%.0f of %.0f MB)' % (cur or 'download', pct, done / 1e6, total / 1e6))
+            continue
+        sys.stderr.write(l + chr(10))
+        sys.stderr.flush()
+        m = re.match(r'Downloading (\S+)', l)
+        if m:
+            cur = m.group(1)[:48]
+        elif l.startswith(('Installing collected', 'Collecting', 'Successfully')):
+            send('S', 'pip: ' + l[:110])
+    send('D', -1, '')
+    if p.wait() != 0:
+        send('S', 'Installing packages failed (see worker.log); trying to continue...')
+
+
+try:
+    ensure_deps()
+except Exception as e:
+    sys.stderr.write('dependency check failed: %r\n' % (e,))
+
+site = os.path.join(sys.prefix, 'Lib', 'site-packages')
+for d in glob.glob(os.path.join(site, 'nvidia', '*', 'bin')):
+    os.add_dll_directory(d)
+    os.environ['PATH'] = d + os.pathsep + os.environ['PATH']
+
 send('S', 'Loading the recognition model %s...' % MODEL)
 import numpy as np
 from faster_whisper import WhisperModel
+
+try:
+    import dl_progress
+    from faster_whisper.utils import _MODELS
+    if MODEL in _MODELS:
+        dl_progress.fetch(_MODELS[MODEL], os.path.join(ROOT, 'hf'), 'Recognition model %s' % MODEL, send,
+                          allow_patterns=['config.json', 'preprocessor_config.json', 'model.bin', 'tokenizer.json', 'vocabulary.*'])
+except Exception as e:
+    sys.stderr.write('model pre-download failed: %r\n' % (e,))
 
 try:
     model = WhisperModel(MODEL, device='cuda', compute_type='float16', download_root=os.path.join(ROOT, 'hf'))
@@ -63,8 +141,8 @@ try:
     send('S', 'Loading the NLLB translation model...')
     import ctranslate2
     from tokenizers import Tokenizer
-    from huggingface_hub import snapshot_download
-    path = snapshot_download(NLLB_REPO, cache_dir=os.path.join(ROOT, 'hf'))
+    import dl_progress
+    path = dl_progress.fetch(NLLB_REPO, os.path.join(ROOT, 'hf'), 'Translation model (NLLB)', send)
     tok = Tokenizer.from_file(os.path.join(path, 'tokenizer.json'))
     try:
         translator = ctranslate2.Translator(path, device='cuda' if dev == 'GPU' else 'cpu',
@@ -83,11 +161,9 @@ try:
     import sherpa_onnx
     spk_path = os.path.join(ROOT, 'speaker', SPK_FILE)
     if not os.path.isfile(spk_path):
-        send('S', 'Downloading the speaker model (26 MB)...')
-        import urllib.request
-        os.makedirs(os.path.dirname(spk_path), exist_ok=True)
-        urllib.request.urlretrieve(SPK_URL, spk_path + '.part')
-        os.replace(spk_path + '.part', spk_path)
+        import dl_progress
+        send('S', 'Downloading the speaker model (one time only)...')
+        dl_progress.download_file(SPK_URL, spk_path, 'Speaker model', send)
     extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
         sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=spk_path, num_threads=2, provider='cpu'))
 except Exception as e:
@@ -99,7 +175,7 @@ except Exception as e:
 src_lang, tgt_lang, reverse, diarize, sens = 'ru', 'none', True, False, 60
 quit_flag = False
 cond = threading.Condition()
-PARTIAL_STEP = int(RATE * 2 * 0.9)   # re-transcribe every ~0.9 s of new audio (bytes)
+PARTIAL_STEP = int(RATE * 2 * (0.9 if dev == 'GPU' else 2.0))   # re-transcribe every ~0.9 s (GPU) / 2 s (CPU) of new audio (bytes)
 cache = {}
 
 

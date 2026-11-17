@@ -35,7 +35,7 @@
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
        ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
-       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV };
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG };
 enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
@@ -53,7 +53,7 @@ static std::atomic<long long> g_sysLastSpeechMs{0};   // for the speaker-echo fi
 static HWND hMain, hMicLbl, hMic, hLang, hStart, hClear, hCopy, hLevel, hLevel2, hStatus, hEdit;
 static HWND hGainLbl, hGain, hGainVal, hAgc, hNs, hNsStr, hNsVal, hBoost;
 static HWND hSysOn, hRev, hEcho, hOne, hMany, hSens, hSensVal;
-static HWND hSysLbl, hSysDev;
+static HWND hSysLbl, hSysDev, hProg;
 static std::vector<std::wstring> g_sysIds;   // endpoint ids of the output devices listed in hSysDev (item 0 = default)
 static std::wstring g_sysIdSel;              // endpoint id used by the loopback thread ("" = default output)
 static HWND hSave, hLangLbl, hTgtLbl, hTgt, hSwap, hCopyTr, hEditTr, hCapSrc, hCapTr;
@@ -64,7 +64,7 @@ static int g_dpi = 96;
 static HANDLE hChildIn = nullptr, hJob = nullptr;
 static PROCESS_INFORMATION g_pi{};
 static std::mutex g_sendLock;
-static std::thread g_reader, g_capture, g_loop;
+static std::thread g_reader, g_capture, g_loop, g_boot;
 static std::atomic<bool> g_capturing{false}, g_sysRun{false};
 static bool g_ready = false;
 
@@ -134,6 +134,10 @@ static void ReaderLoop(HANDLE hOut) {
                     rest = rest.substr(c + 1);
                 }
             }
+            if (m->kind == 'D') {                      // download progress: percent \t text
+                size_t a = rest.find('\t');
+                if (a != std::string::npos) { m->spk = atoi(rest.substr(0, a).c_str()); rest = rest.substr(a + 1); }
+            }
             m->text = Utf8ToW(rest);
             PostMessageW(hMain, WM_WORKER, 0, (LPARAM)m);
         }
@@ -198,6 +202,96 @@ static bool StartWorker() {
     hChildIn = inW;
     g_reader = std::thread(ReaderLoop, outR);
     return true;
+}
+
+// =====================================================================================
+//  First-run bootstrap: find (or install) Python, create the virtual environment.
+//  Python packages and models are then checked / installed by worker.py itself on every start.
+// =====================================================================================
+static void PostStatus(const std::wstring& t) {
+    auto* m = new WorkerMsg();
+    m->kind = 'S';
+    m->text = t;
+    PostMessageW(hMain, WM_WORKER, 0, (LPARAM)m);
+}
+
+// Runs a command without a window and returns its exit code (-1 if it could not start, -2 on timeout).
+static void PostStatus(const std::wstring& t);
+static int RunHidden(const std::wstring& cmdline, DWORD timeoutMs, const wchar_t* label = nullptr) {
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> b(cmdline.begin(), cmdline.end());
+    b.push_back(0);
+    if (!CreateProcessW(nullptr, b.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return -1;
+    DWORD code = (DWORD)-1;
+    DWORD t0 = GetTickCount();
+    for (;;) {
+        DWORD w = WaitForSingleObject(pi.hProcess, 1000);
+        if (w == WAIT_OBJECT_0) { GetExitCodeProcess(pi.hProcess, &code); break; }
+        DWORD el = GetTickCount() - t0;
+        if (el > timeoutMs) { TerminateProcess(pi.hProcess, 1); code = (DWORD)-2; break; }
+        if (label && el % 5000 < 1000)     // progress without a percentage: show the elapsed time
+            PostStatus(std::wstring(label) + L" " + std::to_wstring(el / 1000) + L" s elapsed...");
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)code;
+}
+
+static bool FileExists(const std::wstring& f) { return GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+// A usable Python 3.10+ (the Microsoft Store "python.exe" stub fails this check, as it should).
+static bool PythonWorks(const std::wstring& exe) {
+    return RunHidden(L"\"" + exe + L"\" -c \"import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)\"", 30000) == 0;
+}
+
+static std::wstring FindSystemPython() {
+    std::vector<std::wstring> c = {L"python", L"python3"};
+    wchar_t buf[MAX_PATH];
+    const wchar_t* roots[] = {L"LOCALAPPDATA", L"ProgramFiles"};
+    for (const wchar_t* r : roots) {
+        if (!GetEnvironmentVariableW(r, buf, MAX_PATH)) continue;
+        std::wstring base = buf;
+        for (const wchar_t* v : {L"313", L"312", L"311", L"310"})
+            c.push_back(base + (std::wstring(r) == L"LOCALAPPDATA" ? L"\\Programs\\Python\\Python" : L"\\Python") + v + L"\\python.exe");
+    }
+    for (auto& e : c) {
+        if (e.find(L'\\') != std::wstring::npos && !FileExists(e)) continue;
+        if (PythonWorks(e)) return e;
+    }
+    return L"";
+}
+
+static void BootstrapThread() {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir = exe;
+    dir = dir.substr(0, dir.find_last_of(L"\\/"));
+    wchar_t b[MAX_PATH] = L"";
+    GetPrivateProfileStringW(L"paths", L"python", L"", b, MAX_PATH, g_ini.c_str());
+    std::wstring venvPy = dir + L"\\venv\\Scripts\\python.exe";
+    if (!b[0] && !FileExists(venvPy)) {
+        PostStatus(L"First start: looking for Python...");
+        std::wstring sys = FindSystemPython();
+        if (sys.empty()) {
+            PostStatus(L"Python not found - installing Python 3.12 with winget (one time, a few minutes)...");
+            RunHidden(L"winget install -e --id Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements", 20 * 60 * 1000,
+                      L"Installing Python 3.12 with winget (one time):");
+            sys = FindSystemPython();
+        }
+        if (sys.empty()) {
+            PostStatus(L"Python 3.10+ is required. Install it from python.org (tick \"Add python.exe to PATH\") and start the app again.");
+            return;
+        }
+        PostStatus(L"Creating the Python environment (one time)...");
+        if (RunHidden(L"\"" + sys + L"\" -m venv \"" + dir + L"\\venv\"", 10 * 60 * 1000, L"Creating the Python environment (one time):") != 0 || !FileExists(venvPy)) {
+            PostStatus(L"Could not create the Python environment (venv folder next to the program).");
+            return;
+        }
+    }
+    PostStatus(L"Starting the recognizer (missing packages and models are installed automatically)...");
+    if (!StartWorker()) PostStatus(L"Could not start Python. Run setup.ps1 or set [paths] python= in settings.ini.");
 }
 
 // =====================================================================================
@@ -697,7 +791,8 @@ static void Layout(int w, int h) {
     MoveWindow(hSensVal, m + S(626), y + S(4), S(80), rowH, TRUE);
     y += rowH + m;
     MoveWindow(hStatus, m, y, w - 2 * m, S(20), TRUE);
-    y += S(24);
+    MoveWindow(hProg, m, y + S(22), w - 2 * m, S(8), TRUE);   // download progress bar (shown only while downloading)
+    y += S(34);
     // two panels share the rest
     int capH = S(20);
     int avail = std::max(S(120), h - y - m);
@@ -871,6 +966,9 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hSens, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
         hSensVal = Mk(L"STATIC", L"60%", 0, 0);
         hStatus = Mk(L"STATIC", L"Starting the recognizer...", 0, ID_STATUS);
+        hProg = Mk(PROGRESS_CLASSW, L"", PBS_SMOOTH, ID_PROG);
+        SendMessageW(hProg, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+        ShowWindow(hProg, SW_HIDE);
         hCapSrc = Mk(L"STATIC", L"Recognized speech", 0, 0);
         LoadLibraryW(L"Msftedit.dll");
         hEdit = Mk(L"RICHEDIT50W", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, ID_EDIT, WS_EX_CLIENTEDGE);
@@ -954,7 +1052,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             if (f >= 0) SendMessageW(hMic, CB_SETCURSEL, f, 0);
         }
 
-        if (!StartWorker()) SetStatus(L"Could not start Python. Run setup.ps1 or set [paths] python= in settings.ini.");
+        g_boot = std::thread(BootstrapThread);
         return 0;
     }
     case WM_HSCROLL:
@@ -1051,6 +1149,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         case 'S':
             if (m->text.rfind(L"ready", 0) == 0) {
                 g_ready = true;
+                ShowWindow(hProg, SW_HIDE);
                 SendLanguage();
                 SetStatus(L"Ready " + m->text.substr(6) + (g_trAvailable ? L", NLLB translation enabled." : L", translation unavailable.") +
                           L" Choose a microphone and press Start.");
@@ -1062,6 +1161,12 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(hTgt, CB_SETCURSEL, 0, 0);
             EnableWindow(hTgt, FALSE); EnableWindow(hSwap, FALSE);
             SaveSettings();
+            break;
+        case 'D':  // download / install progress (percent < 0 hides the bar)
+            if (m->spk < 0) { ShowWindow(hProg, SW_HIDE); break; }
+            ShowWindow(hProg, SW_SHOW);
+            SendMessageW(hProg, PBM_SETPOS, std::min(100, m->spk), 0);
+            SetStatus(m->text);
             break;
         case 'V':  // speaker detection engine unavailable
             g_spkAvailable = false;
@@ -1139,5 +1244,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
         if (!IsDialogMessageW(w, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
     }
     if (g_reader.joinable()) g_reader.detach();
+    if (g_boot.joinable()) g_boot.detach();
     return 0;
 }
