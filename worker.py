@@ -1,12 +1,16 @@
-"""Whisper + NLLB worker for VoiceWindow.exe.
-stdin frames : 1 byte type + uint32 LE length + payload
-   'A' = int16 mono 16 kHz audio, 'E' = end of utterance,
-   'L' = "src|tgt" (language codes, src may be "auto", tgt may be "none"), 'Q' = quit
-stdout lines : KIND \\t text \\n
-   S = status, P/F = partial/final recognized text, T/U = partial/final translation,
-   N = translation engine unavailable (message)
+"""Whisper + NLLB + speaker-identification worker for VoiceWindow.exe.
+
+stdin frames  : 1 byte type + uint32 LE length + payload
+   'A' = channel byte + int16 mono 16 kHz audio   (channel 0 = microphone, 1 = system audio)
+   'E' = channel byte                              (end of an utterance on that channel)
+   'L' = "src|tgt|reverse|diarize|sensitivity"     (languages, options)
+   'R' = reset the known speakers
+   'Q' = quit
+stdout lines  : KIND \\t text \\n   for S (status), N (translation unavailable), V (speaker detection unavailable)
+                KIND \\t channel \\t speaker \\t text \\n   for
+                P/F = partial/final recognized text, T/U = partial/final translation
 """
-import os, sys, glob, re, threading, struct
+import os, sys, glob, re, threading, struct, time
 
 ROOT = os.environ.get('DICTATION_ROOT') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 os.makedirs(os.path.join(ROOT, 'tmp'), exist_ok=True)
@@ -25,15 +29,18 @@ MODEL = os.environ.get('DICTATE_MODEL', 'large-v3')
 NLLB_REPO = 'OpenNMT/nllb-200-distilled-1.3B-ct2-int8'
 NLLB = {'ru': 'rus_Cyrl', 'en': 'eng_Latn', 'de': 'deu_Latn', 'fr': 'fra_Latn', 'es': 'spa_Latn',
         'uk': 'ukr_Cyrl', 'pl': 'pol_Latn', 'it': 'ita_Latn'}
+SPK_FILE = 'wespeaker_en_voxceleb_resnet34_LM.onnx'
+SPK_URL = ('https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/' + SPK_FILE)
+MAX_SPEAKERS = 6
 out = sys.stdout.buffer
 inp = sys.stdin.buffer
 out_lock = threading.Lock()
 
 
-def send(kind, text=''):
-    text = text.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+def send(*fields):
+    line = '\t'.join(str(f).replace('\r', ' ').replace('\n', ' ').replace('\t', ' ') for f in fields)
     with out_lock:
-        out.write((kind + '\t' + text + '\n').encode('utf-8'))
+        out.write((line + '\n').encode('utf-8'))
         out.flush()
 
 
@@ -70,26 +77,85 @@ except Exception as e:
     translator = None
     send('N', 'Translation model unavailable: %s' % (e,))
 
-src_lang, tgt_lang = 'ru', 'none'
-buf = bytearray()
-last_len = 0
-final_pending = False
+# ---- speaker embedding model (sherpa-onnx + WeSpeaker), optional ----
+extractor = None
+try:
+    import sherpa_onnx
+    spk_path = os.path.join(ROOT, 'speaker', SPK_FILE)
+    if not os.path.isfile(spk_path):
+        send('S', 'Downloading the speaker model (26 MB)...')
+        import urllib.request
+        os.makedirs(os.path.dirname(spk_path), exist_ok=True)
+        urllib.request.urlretrieve(SPK_URL, spk_path + '.part')
+        os.replace(spk_path + '.part', spk_path)
+    extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
+        sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=spk_path, num_threads=2, provider='cpu'))
+except Exception as e:
+    sys.stderr.write('speaker detection unavailable: %r\n' % (e,))
+    extractor = None
+    send('V', 'Speaker detection unavailable: %s' % (e,))
+
+# ---- shared state ----
+src_lang, tgt_lang, reverse, diarize, sens = 'ru', 'none', True, False, 60
 quit_flag = False
 cond = threading.Condition()
 PARTIAL_STEP = int(RATE * 2 * 0.9)   # re-transcribe every ~0.9 s of new audio (bytes)
 cache = {}
 
 
-def transcribe(audio_bytes, final):
-    audio = np.frombuffer(bytes(audio_bytes), dtype=np.int16).astype(np.float32) / 32768.0
-    if len(audio) < RATE * 0.3:
+class Chan:
+    def __init__(self, idx):
+        self.idx = idx
+        self.buf = bytearray()
+        self.last_len = 0
+        self.final = False
+        self.last_time = 0.0
+        self.cents = []        # speaker centroids (sum of unit embeddings)
+        self.last_spk = 0
+        self.utt_lang = None   # language decided for the utterance in progress
+
+
+chans = [Chan(0), Chan(1)]
+
+
+def plan(c, audio_f32, s, t, rev):
+    """Decide (language to recognize, translation target) for an utterance.
+
+    With a concrete language pair (s, t) every utterance is recognized in whichever of the two languages
+    is actually spoken, and translated into the other one. The microphone leans to `s`; the other side
+    leans to `t` when `rev` is set. Speech language "auto" or no translation falls back to the simple rules."""
+    if s == 'auto' or t == 'none' or s == t:
+        return (None if s == 'auto' else s), t
+    prior = t if (c.idx == 1 and rev) else s
+    lang = c.utt_lang
+    if lang is None and len(audio_f32) >= RATE * 1.2:
+        try:
+            a = audio_f32
+            peak = float(np.abs(a).max())
+            if 0.003 < peak < 0.3:
+                a = a * min(0.5 / peak, 12.0)
+            probs = dict(model.detect_language(a)[2])
+            score = {s: probs.get(s, 0.0), t: probs.get(t, 0.0)}
+            score[prior] += 0.15
+            lang = max(score, key=score.get)
+            c.utt_lang = lang
+        except Exception as e:
+            sys.stderr.write('language detection error: %r\n' % (e,))
+    if lang is None:
+        lang = prior
+    return lang, (t if lang == s else s)
+
+
+def transcribe(audio_f32, final, lang):
+    if len(audio_f32) < RATE * 0.3:
         return '', None
+    audio = audio_f32
     peak = float(np.abs(audio).max())
     if 0.003 < peak < 0.3:          # quiet source (far speaker, low-volume call): lift it, capped gain
         audio = audio * min(0.5 / peak, 12.0)
     segs, info = model.transcribe(
         audio,
-        language=None if src_lang == 'auto' else src_lang,
+        language=None if lang == 'auto' else lang,
         beam_size=5 if final else 1,
         best_of=1,
         temperature=0.0,
@@ -97,7 +163,55 @@ def transcribe(audio_bytes, final):
         condition_on_previous_text=False,
         without_timestamps=True,
     )
-    return ' '.join(s.text.strip() for s in segs).strip(), info.language
+    # drop segments Whisper itself considers non-speech (it likes to invent "Thank you." on noise)
+    short = len(audio_f32) < RATE * 2.5       # short clips are where Whisper hallucinates most
+    nsp, lp = (0.45, -0.45) if short else (0.7, -0.7)
+    text = ' '.join(sg.text.strip() for sg in segs if not (sg.no_speech_prob > nsp and sg.avg_logprob < lp)).strip()
+    return text, info.language
+
+
+def embed(audio_f32):
+    st = extractor.create_stream()
+    st.accept_waveform(RATE, audio_f32)
+    st.input_finished()
+    e = np.array(extractor.compute(st), dtype=np.float32)
+    return e / (np.linalg.norm(e) + 1e-9)
+
+
+def identify(c, audio_f32, final):
+    """Speaker number (1-based) inside a channel; 0 when speaker detection is off.
+
+    A new speaker is only created from a clearly long utterance (>= 2 s): short phrases such as "yes" or
+    "perfect" carry too little voice information and are attached to the closest / previous speaker."""
+    if not diarize or extractor is None:
+        return 0
+    dur = len(audio_f32) / RATE
+    if dur < 1.0:                                   # too short for a reliable voiceprint
+        return c.last_spk or 1
+    e = embed(audio_f32)
+    if not c.cents:
+        if final:
+            c.cents.append(e.copy())
+            c.last_spk = 1
+        return 1
+    sims = [float(e @ (v / (np.linalg.norm(v) + 1e-9))) for v in c.cents]
+    k = int(np.argmax(sims))
+    thr = 0.55 + 0.30 * sens / 100.0
+    if dur < 2.5:
+        thr -= 0.06                                    # short phrases are noisier: lenient about "same voice"
+    if sims[k] >= thr:
+        spk = k + 1
+        if final and dur >= 1.5:
+            c.cents[k] = c.cents[k] + e                # running centroid
+    elif dur >= 2.5 and len(c.cents) < MAX_SPEAKERS:
+        spk = len(c.cents) + 1
+        if final:
+            c.cents.append(e.copy())
+    else:
+        spk = c.last_spk or (k + 1)
+    if final:
+        c.last_spk = spk
+    return spk
 
 
 def translate(text, s, t, final):
@@ -119,36 +233,57 @@ def translate(text, s, t, final):
     return ' '.join(cache[(s, t, final, x)] for x in sents)
 
 
+def pick():
+    """Choose the next job (caller holds cond): finals first, then the channel waiting longest for a partial."""
+    for c in chans:
+        if c.final:
+            audio = bytes(c.buf)
+            c.buf.clear()
+            c.last_len = 0
+            c.final = False
+            return c, audio, True
+    best = None
+    for c in chans:
+        if len(c.buf) > 0 and len(c.buf) - c.last_len >= PARTIAL_STEP:
+            if best is None or c.last_time < best.last_time:
+                best = c
+    if best:
+        best.last_len = len(best.buf)
+        best.last_time = time.time()
+        return best, bytes(best.buf), False
+    return None
+
+
 def worker():
-    global last_len, final_pending
     while True:
         with cond:
-            while not quit_flag and not final_pending and not (len(buf) > 0 and len(buf) - last_len >= PARTIAL_STEP):
+            job = pick()
+            while job is None and not quit_flag:
                 cond.wait(0.2)
+                job = pick()
             if quit_flag:
                 return
-            audio = bytes(buf)
-            s, t = src_lang, tgt_lang
-            if final_pending:
-                is_final = True
-                buf.clear()
-                last_len = 0
-                final_pending = False
-            else:
-                is_final = False
-                last_len = len(buf)
-        text, lang = '', None
+            c, raw, is_final = job
+            s, t, rev = src_lang, tgt_lang, reverse
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        text, det, spk = '', None, 0
+        want, target = s, t
         try:
-            text, lang = transcribe(audio, is_final)
+            want, target = plan(c, audio, s, t, rev)
+            text, det = transcribe(audio, is_final, want)
+            if text:
+                spk = identify(c, audio, is_final)
         except Exception as e:
             sys.stderr.write('transcribe error: %r\n' % (e,))
-        send('F' if is_final else 'P', text)
+        if is_final:
+            c.utt_lang = None
+        send('F' if is_final else 'P', c.idx, spk, want or det or '', text)
         try:
-            tr = translate(text, lang if s == 'auto' else s, t, is_final) if text else ''
+            tr = translate(text, want or det, target, is_final) if text else ''
         except Exception as e:
             sys.stderr.write('translate error: %r\n' % (e,))
             tr = ''
-        send('U' if is_final else 'T', tr)
+        send('U' if is_final else 'T', c.idx, spk, target if target != 'none' else '', tr)
 
 
 threading.Thread(target=worker, daemon=True).start()
@@ -171,18 +306,29 @@ try:
         t = chr(hdr[0])
         n = struct.unpack('<I', hdr[1:])[0]
         payload = read_exact(n) if n else b''
-        if t == 'A':
+        if t == 'A' and len(payload) > 1 and payload[0] < 2:
             with cond:
-                buf.extend(payload)
+                chans[payload[0]].buf.extend(payload[1:])
                 cond.notify()
-        elif t == 'E':
+        elif t == 'E' and payload and payload[0] < 2:
             with cond:
-                final_pending = True
+                chans[payload[0]].final = True
                 cond.notify()
         elif t == 'L':
             parts = payload.decode('utf-8', 'ignore').split('|')
-            if len(parts) == 2:
-                src_lang, tgt_lang = parts
+            if len(parts) >= 5:
+                with cond:
+                    src_lang, tgt_lang = parts[0], parts[1]
+                    reverse, diarize = parts[2] == '1', parts[3] == '1'
+                    try:
+                        sens = max(0, min(100, int(parts[4])))
+                    except ValueError:
+                        pass
+        elif t == 'R':
+            with cond:
+                for c in chans:
+                    c.cents.clear()
+                    c.last_spk = 0
         elif t == 'Q':
             break
 except EOFError:

@@ -28,6 +28,9 @@ Pick a microphone, choose the spoken language and the target language (for examp
 - **Live speech recognition** with [Whisper large-v3](https://github.com/openai/whisper) running through [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2). Partial text is refreshed about once per second while you speak; each phrase is finalized with a more accurate pass after a pause.
 - **Live text translation** with [NLLB-200 (distilled 1.3B)](https://huggingface.co/facebook/nllb-200-distilled-1.3B), also on CTranslate2 (int8). Translation is text only – there is no speech synthesis.
 - **Languages:** Russian, English, German, French, Spanish, Ukrainian, Polish, Italian. The speech language can also be set to *Auto*; the translation can be switched off. The **swap** button reverses the direction in one click.
+- **Conversation mode:** tick *Capture the other side (system audio)* and the app listens to two sources at once - your microphone (**You**) and whatever your PC plays, e.g. a call in Zoom, Teams or Discord (**Them**, captured with WASAPI loopback). Every line goes on its own row with a coloured speaker label, in both panels. Each utterance is recognized in whichever of the two chosen languages is actually spoken and translated into the other one.
+- **One or several interlocutors:** *One interlocutor* labels everything from the other side as "Them". *Several (detect voices)* tells voices apart with a speaker-embedding model (WeSpeaker via sherpa-onnx) and labels them "Them", "Them 2", "Them 3"...; the *sensitivity* slider controls how readily a new voice is created.
+- **Echo filter:** with loudspeakers your microphone also hears the other side. *Speakers mode (echo filter)* mutes the microphone while the other side is audible, so nothing is duplicated; turn it off when you use headphones.
 - **Microphone selection** from the list of Windows input devices.
 - **Sound controls**, applied before recognition:
   - gain slider, from -10 dB to +30 dB;
@@ -90,6 +93,7 @@ All Python dependencies are listed in [`requirements.txt`](requirements.txt); a 
 - `faster-whisper`, `ctranslate2` – inference engines
 - `tokenizers`, `huggingface_hub` – NLLB tokenizer and model download
 - `numpy`
+- `sherpa-onnx` - speaker embeddings for the "several interlocutors" mode
 - `nvidia-cublas-cu12`, `nvidia-cudnn-cu12` – CUDA 12 runtime libraries for GPU inference (installed from PyPI, no separate CUDA toolkit needed)
 
 Models (downloaded by `download_models.py` or on first start into `data/hf`):
@@ -98,6 +102,7 @@ Models (downloaded by `download_models.py` or on first start into `data/hf`):
 |---------|-------|------|
 | Speech recognition | [`Systran/faster-whisper-large-v3`](https://huggingface.co/Systran/faster-whisper-large-v3) | ~3 GB |
 | Translation | [`OpenNMT/nllb-200-distilled-1.3B-ct2-int8`](https://huggingface.co/OpenNMT/nllb-200-distilled-1.3B-ct2-int8) | ~1.4 GB |
+| Speaker detection | WeSpeaker ResNet34 (`wespeaker_en_voxceleb_resnet34_LM.onnx`, from the sherpa-onnx releases) | 26 MB |
 
 ## Configuration
 
@@ -124,6 +129,8 @@ Environment variables read by the worker:
 - **Background noise** (fan, keyboard): enable *Noise suppression* and raise its strength until the noise stops producing text; very high values can clip the beginnings of words.
 - **Direction swap:** the button works when both languages are concrete (not *Auto* and not *No translation*).
 - **Long monologues** are split automatically every 20 seconds so that latency stays low.
+
+- **Loopback hears everything your PC plays.** Music or a video playing next to the call ends up in the "Them" side too - pause it, or use the call app's own output device.
 
 ## Troubleshooting
 

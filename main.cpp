@@ -1,4 +1,8 @@
-// VoiceWindow: window with microphone picker, live speech-to-text via the Whisper worker in H:\Dictation.
+// VoiceWindow: live speech recognition + text translation with a two-sided conversation mode.
+//
+//   channel 0 = microphone (you), channel 1 = system audio (the other side, WASAPI loopback)
+//   Every channel has its own gain / noise suppression / speech detector; audio goes to worker.py,
+//   which returns recognized text, translation and (optionally) the speaker number inside the channel.
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -7,13 +11,18 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <audioclient.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <mmdeviceapi.h>
+#include <mmreg.h>
 #include <mmsystem.h>
-#include <atomic>
+#include <richedit.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,12 +30,13 @@
 #include <vector>
 
 // Paths are resolved at start-up (see StartWorker): settings.ini [paths] python / root,
-// otherwise <exe dir>\\venv\\Scripts\\python.exe and <exe dir>\\data.
+// otherwise <exe dir>\venv\Scripts\python.exe and <exe dir>\data.
 
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
-       ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST };
-enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2 };
+       ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2 };
+enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
 struct Lang { const wchar_t* code; const wchar_t* name; };
@@ -34,25 +44,26 @@ static const Lang LANGS[] = {{L"ru", L"Russian"}, {L"en", L"English"}, {L"de", L
                              {L"es", L"Spanish"}, {L"uk", L"Ukrainian"}, {L"pl", L"Polish"}, {L"it", L"Italian"}};
 static const int NLANGS = sizeof(LANGS) / sizeof(LANGS[0]);
 
-// ---- globals ----
-static HWND hMain, hMicLbl, hMic, hLang, hStart, hClear, hCopy, hLevel, hStatus, hEdit;
-// ---- audio processing (settings shared with the UI thread) ----
+// ---- settings shared with the audio threads ----
 static std::atomic<int> g_gainDb{0}, g_ns{1}, g_nsStr{50}, g_agc{1}, g_boost{0};
+static std::atomic<int> g_sysOn{0}, g_rev{1}, g_echo{0}, g_diar{0}, g_sens{60};
+static std::atomic<long long> g_sysLastSpeechMs{0};   // for the speaker-echo filter
+
+// ---- window handles and state ----
+static HWND hMain, hMicLbl, hMic, hLang, hStart, hClear, hCopy, hLevel, hLevel2, hStatus, hEdit;
 static HWND hGainLbl, hGain, hGainVal, hAgc, hNs, hNsStr, hNsVal, hBoost;
+static HWND hSysOn, hRev, hEcho, hOne, hMany, hSens, hSensVal;
 static HWND hSave, hLangLbl, hTgtLbl, hTgt, hSwap, hCopyTr, hEditTr, hCapSrc, hCapTr;
 static HFONT hFont, hBigFont, hBoldFont;
-static HBRUSH hTrBrush;
-static std::wstring g_trCommitted, g_trPartial;
-static bool g_trAvailable = true;
+static bool g_trAvailable = true, g_spkAvailable = true;
 static std::wstring g_ini;
 static int g_dpi = 96;
 static HANDLE hChildIn = nullptr, hJob = nullptr;
 static PROCESS_INFORMATION g_pi{};
 static std::mutex g_sendLock;
-static std::thread g_reader, g_capture;
-static std::atomic<bool> g_capturing{false};
+static std::thread g_reader, g_capture, g_loop;
+static std::atomic<bool> g_capturing{false}, g_sysRun{false};
 static bool g_ready = false;
-static std::wstring g_committed, g_partial;
 
 static HWAVEIN g_wi = nullptr;
 static HANDLE g_waveEv = nullptr;
@@ -61,6 +72,7 @@ static WAVEHDR g_hdr[NB];
 static short g_bufs[NB][CHUNK];
 
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
+static long long NowMs() { return (long long)GetTickCount64(); }
 
 static std::wstring Utf8ToW(const std::string& s) {
     if (s.empty()) return L"";
@@ -83,8 +95,16 @@ static void SendFrame(char type, const void* data, uint32_t len) {
     DWORD w;
     WriteFile(hChildIn, f.data(), (DWORD)f.size(), &w, nullptr);
 }
+static void SendAudio(int ch, const short* pcm, int n) {   // payload: channel byte + int16 samples
+    std::vector<char> p(1 + n * 2);
+    p[0] = (char)ch;
+    memcpy(&p[1], pcm, n * 2);
+    SendFrame('A', p.data(), (uint32_t)p.size());
+}
+static void SendEnd(int ch) { char c = (char)ch; SendFrame('E', &c, 1); }
 
-struct WorkerMsg { char kind; std::wstring text; };
+// kind: S N V X (status) or P F T U (channel, speaker, text)
+struct WorkerMsg { char kind; int ch = 0, spk = 0; std::string lang; std::wstring text; };
 
 static void ReaderLoop(HANDLE hOut) {
     std::string acc;
@@ -97,11 +117,27 @@ static void ReaderLoop(HANDLE hOut) {
             std::string line = acc.substr(0, p);
             acc.erase(0, p + 1);
             if (line.size() < 2) continue;
-            auto* m = new WorkerMsg{line[0], Utf8ToW(line.size() > 2 ? line.substr(2) : "")};
+            auto* m = new WorkerMsg();
+            m->kind = line[0];
+            std::string rest = line.size() > 2 ? line.substr(2) : "";
+            if (strchr("PFTU", m->kind)) {            // channel \t speaker \t language \t text
+                size_t a = rest.find('\t');
+                size_t b = a == std::string::npos ? a : rest.find('\t', a + 1);
+                size_t c = b == std::string::npos ? b : rest.find('\t', b + 1);
+                if (c != std::string::npos) {
+                    m->ch = atoi(rest.substr(0, a).c_str());
+                    m->spk = atoi(rest.substr(a + 1, b - a - 1).c_str());
+                    m->lang = rest.substr(b + 1, c - b - 1);
+                    rest = rest.substr(c + 1);
+                }
+            }
+            m->text = Utf8ToW(rest);
             PostMessageW(hMain, WM_WORKER, 0, (LPARAM)m);
         }
     }
-    PostMessageW(hMain, WM_WORKER, 0, (LPARAM) new WorkerMsg{'X', L""});
+    auto* x = new WorkerMsg();
+    x->kind = 'X';
+    PostMessageW(hMain, WM_WORKER, 0, (LPARAM)x);
 }
 
 static bool StartWorker() {
@@ -161,15 +197,102 @@ static bool StartWorker() {
     return true;
 }
 
-// ---- text view ----
-static void ShowIn(HWND e, const std::wstring& all) {
-    SetWindowTextW(e, all.c_str());
-    int len = (int)all.size();
-    SendMessageW(e, EM_SETSEL, len, len);
-    SendMessageW(e, EM_SCROLLCARET, 0, 0);
+// =====================================================================================
+//  Conversation model + colored rich-text panes
+// =====================================================================================
+struct Entry { int ch = 0, spk = 0; bool labeled = false; std::wstring text; };
+struct Utt {                       // one finished utterance (for saving both language versions)
+    int ch, spk; bool labeled;
+    std::wstring orig, tr;
+    std::string oLang, tLang;      // language codes of the original / translation ("auto" = unknown)
+};
+struct Pane {
+    HWND h = nullptr;
+    std::vector<Entry> done;       // committed lines
+    Entry live[2];                 // current partial line of each channel
+    bool has[2] = {false, false};
+    LONG doneLen = 0;              // characters of the control occupied by committed lines
+};
+static Pane g_src, g_tr;
+static std::vector<Utt> g_utts;
+static std::deque<int> g_await[2]; // per channel: utterance index (or -1) waiting for its translation
+
+static bool Labeled() { return g_sysOn || g_diar; }   // "several" mode or two-sided mode shows speaker labels
+
+static std::wstring LabelOf(int ch, int spk) {
+    std::wstring b = ch == 0 ? L"You" : L"Them";
+    return spk >= 2 ? b + L" " + std::to_wstring(spk) : b;
 }
-static void RefreshText() { ShowIn(hEdit, g_committed + g_partial); }
-static void RefreshTr() { ShowIn(hEditTr, g_trCommitted + g_trPartial); }
+static COLORREF ColorOf(int ch, int spk) {
+    static const COLORREF P0[6] = {RGB(0, 84, 166), RGB(123, 63, 180), RGB(0, 130, 140), RGB(70, 70, 170), RGB(160, 50, 120), RGB(70, 110, 140)};
+    static const COLORREF P1[6] = {RGB(20, 130, 50), RGB(205, 100, 10), RGB(190, 40, 50), RGB(120, 120, 0), RGB(130, 80, 40), RGB(190, 40, 160)};
+    int i = (std::max(spk, 1) - 1) % 6;
+    return ch == 0 ? P0[i] : P1[i];
+}
+static COLORREF Fade(COLORREF c) {   // partial (not yet final) text is drawn lighter
+    auto mix = [](int a) { return (int)(a * 0.62 + 255 * 0.38); };
+    return RGB(mix(GetRValue(c)), mix(GetGValue(c)), mix(GetBValue(c)));
+}
+
+static LONG TextLen(HWND h) {
+    GETTEXTLENGTHEX g{GTL_DEFAULT, 1200};
+    return (LONG)SendMessageW(h, EM_GETTEXTLENGTHEX, (WPARAM)&g, 0);
+}
+static void AppendRun(HWND h, const std::wstring& t, COLORREF c, bool bold) {
+    if (t.empty()) return;
+    LONG s = TextLen(h);
+    SendMessageW(h, EM_SETSEL, s, s);
+    SendMessageW(h, EM_REPLACESEL, FALSE, (LPARAM)t.c_str());
+    LONG e = TextLen(h);
+    SendMessageW(h, EM_SETSEL, s, e);
+    CHARFORMAT2W cf{};
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_COLOR | CFM_BOLD;
+    cf.crTextColor = c;
+    cf.dwEffects = bold ? CFE_BOLD : 0;
+    SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    SendMessageW(h, EM_SETSEL, e, e);
+}
+static void AppendEntry(HWND h, const Entry& e, bool live) {
+    COLORREF c = e.labeled ? ColorOf(e.ch, e.spk) : RGB(30, 30, 30);
+    if (live) c = Fade(c);
+    if (e.labeled) AppendRun(h, LabelOf(e.ch, e.spk) + L": ", c, true);
+    AppendRun(h, e.text, c, false);
+    AppendRun(h, L"\r", c, false);
+}
+static bool AtBottom(HWND h) {
+    SCROLLINFO si{sizeof si, SIF_ALL};
+    if (!GetScrollInfo(h, SB_VERT, &si)) return true;
+    return si.nMax <= 0 || si.nPos + (int)si.nPage >= si.nMax - 2;
+}
+// Redraws the volatile tail (partial lines), optionally committing one finished entry first.
+static void PaneRender(Pane& p, const Entry* commit) {
+    HWND h = p.h;
+    bool bottom = AtBottom(h);
+    SendMessageW(h, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(h, EM_SETSEL, p.doneLen, -1);
+    SendMessageW(h, EM_REPLACESEL, FALSE, (LPARAM)L"");
+    if (commit) { AppendEntry(h, *commit, false); p.doneLen = TextLen(h); }
+    for (int c = 0; c < 2; c++)
+        if (p.has[c] && !p.live[c].text.empty()) AppendEntry(h, p.live[c], true);
+    SendMessageW(h, WM_SETREDRAW, TRUE, 0);
+    if (bottom) SendMessageW(h, WM_VSCROLL, SB_BOTTOM, 0);
+    InvalidateRect(h, nullptr, TRUE);
+}
+static void PaneSetLive(Pane& p, int ch, const Entry& e) { p.live[ch] = e; p.has[ch] = !e.text.empty(); PaneRender(p, nullptr); }
+static void PaneCommit(Pane& p, const Entry& e) { p.done.push_back(e); p.has[e.ch] = false; PaneRender(p, &e); }
+static void PaneClearLive(Pane& p, int ch) { p.has[ch] = false; PaneRender(p, nullptr); }
+static void PaneClear(Pane& p) {
+    p.done.clear(); p.has[0] = p.has[1] = false; p.doneLen = 0;
+    SetWindowTextW(p.h, L"");
+}
+static std::wstring PanePlain(const Pane& p) {
+    std::wstring r;
+    auto line = [&](const Entry& e) { r += (e.labeled ? L"[" + LabelOf(e.ch, e.spk) + L"] " : L"") + e.text + L"\r\n"; };
+    for (auto& e : p.done) line(e);
+    for (int c = 0; c < 2; c++) if (p.has[c]) line(p.live[c]);
+    return r;
+}
 
 // Combo item data: language index (0..NLANGS-1) or -1 for "Auto" / "No translation".
 static std::string CodeOf(HWND combo, const char* special) {
@@ -181,51 +304,72 @@ static std::string CodeOf(HWND combo, const char* special) {
     return c;
 }
 
-static void UpdateFx(bool save);
+static bool Checked(HWND h);
 static void SaveSettings() {
     if (g_ini.empty()) return;
+    auto put = [](const wchar_t* k, long long v) {
+        WritePrivateProfileStringW(L"app", k, std::to_wstring(v).c_str(), g_ini.c_str());
+    };
     int mic = (int)SendMessageW(hMic, CB_GETCURSEL, 0, 0);
     wchar_t name[256] = L"";
     if (mic >= 0) SendMessageW(hMic, CB_GETLBTEXT, mic, (LPARAM)name);
     WritePrivateProfileStringW(L"app", L"mic", name, g_ini.c_str());
-    WritePrivateProfileStringW(L"app", L"src", std::to_wstring(SendMessageW(hLang, CB_GETCURSEL, 0, 0)).c_str(), g_ini.c_str());
-    WritePrivateProfileStringW(L"app", L"tgt", std::to_wstring(SendMessageW(hTgt, CB_GETCURSEL, 0, 0)).c_str(), g_ini.c_str());
-    WritePrivateProfileStringW(L"app", L"gain", std::to_wstring(g_gainDb + 10).c_str(), g_ini.c_str());
-    WritePrivateProfileStringW(L"app", L"ns", std::to_wstring(g_ns.load()).c_str(), g_ini.c_str());
-    WritePrivateProfileStringW(L"app", L"nsv", std::to_wstring(g_nsStr.load()).c_str(), g_ini.c_str());
-    WritePrivateProfileStringW(L"app", L"agc", std::to_wstring(g_agc.load()).c_str(), g_ini.c_str());
-    WritePrivateProfileStringW(L"app", L"boost", std::to_wstring(g_boost.load()).c_str(), g_ini.c_str());
+    put(L"src", SendMessageW(hLang, CB_GETCURSEL, 0, 0));
+    put(L"tgt", SendMessageW(hTgt, CB_GETCURSEL, 0, 0));
+    put(L"gain", g_gainDb + 10);
+    put(L"ns", g_ns); put(L"nsv", g_nsStr); put(L"agc", g_agc); put(L"boost", g_boost);
+    put(L"sys", g_sysOn); put(L"rev", g_rev); put(L"echo", g_echo); put(L"diar", Checked(hMany)); put(L"sens", g_sens);
+}
+
+static bool Checked(HWND h) { return SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED; }
+
+static void SendLanguage() {
+    std::string msg = CodeOf(hLang, "auto") + "|" + CodeOf(hTgt, "none") + "|" + (g_rev ? "1" : "0") + "|" +
+                      (g_diar ? "1" : "0") + "|" + std::to_string(g_sens.load());
+    SendFrame('L', msg.data(), (uint32_t)msg.size());
 }
 
 // read the controls into the audio-thread settings and refresh the value labels
 static void UpdateFx(bool save) {
     g_gainDb = (int)SendMessageW(hGain, TBM_GETPOS, 0, 0);
     g_nsStr = (int)SendMessageW(hNsStr, TBM_GETPOS, 0, 0);
-    g_ns = SendMessageW(hNs, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    g_agc = SendMessageW(hAgc, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    g_boost = SendMessageW(hBoost, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_ns = Checked(hNs);
+    g_agc = Checked(hAgc);
+    g_boost = Checked(hBoost);
     wchar_t t[48];
     swprintf(t, 48, L"%+d dB", g_gainDb.load()); SetWindowTextW(hGainVal, t);
     swprintf(t, 48, L"strength %d%%", g_nsStr.load()); SetWindowTextW(hNsVal, t);
     EnableWindow(hNsStr, g_ns);
     if (save) SaveSettings();
 }
-
-static void SendLanguage() {
-    std::string msg = CodeOf(hLang, "auto") + "|" + CodeOf(hTgt, "none");
-    SendFrame('L', msg.data(), (uint32_t)msg.size());
+static void UpdateConv(bool save) {
+    g_sysOn = Checked(hSysOn);
+    g_rev = Checked(hRev);
+    g_echo = Checked(hEcho);
+    g_diar = Checked(hMany) && g_spkAvailable;
+    g_sens = (int)SendMessageW(hSens, TBM_GETPOS, 0, 0);
+    wchar_t t[48];
+    swprintf(t, 48, L"%d%%", g_sens.load()); SetWindowTextW(hSensVal, t);
+    EnableWindow(hRev, g_sysOn);
+    EnableWindow(hEcho, g_sysOn);
+    EnableWindow(hSens, g_diar);
+    if (g_ready) SendLanguage();
+    if (save) SaveSettings();
 }
 
-// ---- audio processing ----
-
+// =====================================================================================
+//  Audio processing: gain / AGC / noise suppression, then an energy speech detector per channel
+// =====================================================================================
 struct Fx { float hx = 0, hy = 0, noise = 40, gate = 1, agc = 1, prevG = 1; };
 
 // High-pass (rumble) + adaptive noise gate + manual gain / boost / automatic gain control.
-static void ProcessChunk(Fx& fx, short* s, int n) {
+// `mic` = false for system audio: it is clean digital sound, so the microphone gain / boost / noise gate are
+// not applied to it (they would only clip it); automatic gain control still applies.
+static void ProcessChunk(Fx& fx, short* s, int n, bool mic) {
     const int B = 160;  // 10 ms blocks
-    const bool ns = g_ns, agcOn = g_agc;
+    const bool ns = mic && g_ns, agcOn = g_agc;
     const float st = g_nsStr / 100.0f;
-    const float baseLin = std::pow(10.0f, (g_gainDb + (g_boost ? 12 : 0)) / 20.0f);
+    const float baseLin = mic ? std::pow(10.0f, (g_gainDb + (g_boost ? 12 : 0)) / 20.0f) : 1.0f;
     float v[B];
     for (int o = 0; o < n; o += B) {
         int m = std::min(B, n - o);
@@ -262,62 +406,189 @@ static void ProcessChunk(Fx& fx, short* s, int n) {
     }
 }
 
-// ---- audio capture + simple energy VAD ----
-static void CaptureLoop() {
-    const int PREROLL = 3;          // chunks kept before speech start
-    const int HANG_CHUNKS = 7;      // 0.7 s of silence ends an utterance
-    const int MAX_CHUNKS = 200;     // 20 s hard cap
+// One audio channel: processing + speech detector + framing towards the worker.
+struct Channel {
+    int id;
+    Fx fx;
     std::vector<std::vector<short>> pre;
-    bool speaking = false;
-    int silence = 0, total = 0, cur = 0, loud = 0;
-    // Noise floor = low percentile of the last 15 s of levels (speech and silence alike), so quiet
-    // speech can never drag the threshold upward; the threshold is also hard-capped.
     std::vector<double> hist;
     size_t histPos = 0;
-    Fx fx;
-    const size_t HIST = 150;
+    bool speaking = false, suppressed = false;
+    int silence = 0, total = 0, loud = 0, guard = 0, relLoud = 0;
 
+    explicit Channel(int i = 0) : id(i) {}
+
+    // Feed one 100 ms chunk (16 kHz mono int16); modifies the samples in place.
+    void Feed(short* s, int n) {
+        const int PREROLL = 3;          // chunks kept before speech start
+        const int HANG_CHUNKS = 7;      // 0.7 s of silence ends an utterance
+        const int MAX_CHUNKS = 200;     // 20 s hard cap
+        const size_t HIST = 150;
+        ProcessChunk(fx, s, n, id == 0);
+        double acc = 0;
+        for (int i = 0; i < n; i++) acc += (double)s[i] * s[i];
+        double rms = n ? std::sqrt(acc / n) : 0;
+        PostMessageW(hMain, WM_LEVEL, (WPARAM)std::min(100.0, rms / 12.0), (speaking ? 1 : 0) | (id << 1));
+
+        // Noise floor = low percentile of the last 15 s of levels (speech and silence alike), so quiet
+        // speech can never drag the threshold upward; the threshold is also hard-capped.
+        if (hist.size() < HIST) hist.push_back(rms); else hist[histPos++ % HIST] = rms;
+        std::vector<double> sorted(hist);
+        std::sort(sorted.begin(), sorted.end());
+        double floorRms = sorted[sorted.size() * 15 / 100];
+        double thr = std::min(700.0, std::max(80.0, floorRms * 3.0));
+        bool isSpeech = rms > (speaking ? thr * 0.6 : thr);   // hysteresis
+        if (id == 1 && isSpeech) g_sysLastSpeechMs = NowMs();
+
+        pre.emplace_back(s, s + n);                       // rolling pre-roll (also used when an echo hold ends)
+        if ((int)pre.size() > PREROLL) pre.erase(pre.begin());
+        // Echo filter: with loudspeakers the microphone hears the other side too. While the system audio
+        // carries speech, a microphone utterance is held back; once the other side is silent and you are
+        // still talking, it is released (so your own words are kept, their echo is dropped).
+        const bool echoNow = id == 0 && g_echo && g_sysOn && NowMs() - g_sysLastSpeechMs < 650;
+        if (!speaking) {
+            loud = isSpeech ? loud + 1 : 0;
+            if (loud >= 2) {  // two loud chunks in a row = speech start
+                speaking = true; silence = 0; total = 0; guard = 0;
+                suppressed = echoNow;
+                if (!suppressed)
+                    for (auto& c : pre) { SendAudio(id, c.data(), (int)c.size()); total++; }
+                pre.clear();
+            }
+        } else {
+            if (echoNow && !suppressed) { SendEnd(id); suppressed = true; }   // the other side became audible: stop feeding the microphone
+            relLoud = (suppressed && !echoNow && isSpeech) ? relLoud + 1 : 0;
+            if (suppressed && relLoud >= 2) {              // the other side stopped and you keep talking: release
+                suppressed = false; silence = 0; total = 0; relLoud = 0;
+                for (auto& c : pre) { SendAudio(id, c.data(), (int)c.size()); total++; }
+                pre.clear();
+            } else if (!suppressed) {
+                SendAudio(id, s, n);
+                total++;
+            }
+            silence = isSpeech ? 0 : silence + 1;
+            if (silence >= HANG_CHUNKS || ++guard >= MAX_CHUNKS + 40) {
+                if (!suppressed) SendEnd(id);
+                speaking = false; suppressed = false; loud = 0;
+            }
+        }
+    }
+    void Flush() { if (speaking && !suppressed) SendEnd(id); speaking = false; suppressed = false; }
+};
+static Channel g_ch[2] = {Channel(0), Channel(1)};
+
+// ---- channel 0: microphone (WinMM) ----
+static void MicLoop() {
+    int cur = 0;
     while (g_capturing) {
         WaitForSingleObject(g_waveEv, 200);
         while (g_capturing && (g_hdr[cur].dwFlags & WHDR_DONE)) {
             WAVEHDR& h = g_hdr[cur];
-            int n = (int)(h.dwBytesRecorded / 2);
-            short* s = (short*)h.lpData;
-            ProcessChunk(fx, s, n);
-            double acc = 0;
-            for (int i = 0; i < n; i++) acc += (double)s[i] * s[i];
-            double rms = n ? std::sqrt(acc / n) : 0;
-            PostMessageW(hMain, WM_LEVEL, (WPARAM)std::min(100.0, rms / 12.0), speaking ? 1 : 0);
-
-            if (hist.size() < HIST) hist.push_back(rms); else hist[histPos++ % HIST] = rms;
-            std::vector<double> sorted(hist);
-            std::sort(sorted.begin(), sorted.end());
-            double floorRms = sorted[sorted.size() * 15 / 100];
-            double thr = std::min(700.0, std::max(80.0, floorRms * 3.0));
-            bool isSpeech = rms > (speaking ? thr * 0.6 : thr);   // hysteresis
-            if (!speaking) {
-                loud = isSpeech ? loud + 1 : 0;
-                pre.emplace_back(s, s + n);
-                if ((int)pre.size() > PREROLL) pre.erase(pre.begin());
-                if (loud >= 2) {  // two loud chunks in a row = speech start
-                    speaking = true; silence = 0; total = 0;
-                    for (auto& c : pre) { SendFrame('A', c.data(), (uint32_t)(c.size() * 2)); total++; }
-                    pre.clear();
-                }
-            } else {
-                SendFrame('A', s, (uint32_t)(n * 2));
-                total++;
-                silence = isSpeech ? 0 : silence + 1;
-                if (silence >= HANG_CHUNKS || total >= MAX_CHUNKS) {
-                    SendFrame('E', nullptr, 0);
-                    speaking = false; loud = 0;
-                }
-            }
+            g_ch[0].Feed((short*)h.lpData, (int)(h.dwBytesRecorded / 2));
             waveInAddBuffer(g_wi, &h, sizeof h);
             cur = (cur + 1) % NB;
         }
     }
-    if (speaking) SendFrame('E', nullptr, 0);
+    g_ch[0].Flush();
+}
+
+// COM identifiers (declared here so no extra import library is needed)
+static const GUID G_CLSID_MMDeviceEnumerator = {0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
+static const GUID G_IID_IMMDeviceEnumerator = {0xA95664D2, 0x9614, 0x4F35, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}};
+static const GUID G_IID_IAudioClient = {0x1CB9AD4C, 0xDBFA, 0x4C32, {0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2}};
+static const GUID G_IID_IAudioCaptureClient = {0xC8ADBD64, 0xE71E, 0x48A0, {0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17}};
+
+// ---- channel 1: system audio = what the other side says (WASAPI loopback of the default output) ----
+static void LoopbackLoop() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDevice* dev = nullptr;
+    IAudioClient* ac = nullptr;
+    IAudioCaptureClient* cap = nullptr;
+    WAVEFORMATEX* wfx = nullptr;
+    auto fail = [](const wchar_t* msg) { PostMessageW(hMain, WM_SYSERR, 0, (LPARAM) new std::wstring(msg)); };
+    do {
+        if (FAILED(CoCreateInstance(G_CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, G_IID_IMMDeviceEnumerator, (void**)&en))) { fail(L"audio device enumerator"); break; }
+        if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev))) { fail(L"no default output device"); break; }
+        if (FAILED(dev->Activate(G_IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&ac))) { fail(L"cannot open the output device"); break; }
+        if (FAILED(ac->GetMixFormat(&wfx))) { fail(L"cannot read the output format"); break; }
+        if (FAILED(ac->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10000000, 0, wfx, nullptr))) { fail(L"loopback capture is not available"); break; }
+        if (FAILED(ac->GetService(G_IID_IAudioCaptureClient, (void**)&cap))) { fail(L"cannot start loopback capture"); break; }
+        const bool isFloat = wfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+                             (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                              ((WAVEFORMATEXTENSIBLE*)wfx)->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT);
+        const int chn = std::max<int>(1, wfx->nChannels), bits = wfx->wBitsPerSample;
+        const double inRate = wfx->nSamplesPerSec;
+        if (FAILED(ac->Start())) { fail(L"cannot start loopback capture"); break; }
+
+        std::vector<short> chunk;
+        chunk.reserve(CHUNK);
+        long long delivered = 0;
+        LARGE_INTEGER freq, t0;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&t0);
+        double phase = 0, acc = 0;
+        int cnt = 0;
+        auto emit = [&](float v) {
+            chunk.push_back((short)std::max(-32767.f, std::min(32767.f, v * 32767.f)));
+            if ((int)chunk.size() == CHUNK) { g_ch[1].Feed(chunk.data(), CHUNK); delivered += CHUNK; chunk.clear(); }
+        };
+        while (g_sysRun) {
+            Sleep(8);
+            UINT32 np = 0;
+            while (g_sysRun && SUCCEEDED(cap->GetNextPacketSize(&np)) && np > 0) {
+                BYTE* d; UINT32 nf; DWORD fl;
+                if (FAILED(cap->GetBuffer(&d, &nf, &fl, nullptr, nullptr))) break;
+                for (UINT32 i = 0; i < nf; i++) {
+                    float m = 0;
+                    if (!(fl & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                        for (int c = 0; c < chn; c++) {
+                            size_t k = (size_t)i * chn + c;
+                            if (isFloat && bits == 32) m += ((const float*)d)[k];
+                            else if (bits == 16) m += ((const short*)d)[k] / 32768.f;
+                            else if (bits == 32) m += ((const int32_t*)d)[k] / 2147483648.f;
+                            else if (bits == 24) {
+                                const BYTE* b = d + k * 3;
+                                int32_t v = (b[0] << 8) | (b[1] << 16) | (b[2] << 24);
+                                m += v / 2147483648.f;
+                            }
+                        }
+                        m /= chn;
+                    }
+                    acc += m; cnt++; phase += 16000.0;
+                    if (phase >= inRate) { phase -= inRate; emit((float)(acc / cnt)); acc = 0; cnt = 0; }   // box-filter downsampling
+                }
+                cap->ReleaseBuffer(nf);
+            }
+            // The device sends nothing while nothing plays: keep real-time pace with silence so the
+            // speech detector can finish an utterance when the other side stops talking.
+            LARGE_INTEGER t;
+            QueryPerformanceCounter(&t);
+            long long expected = (long long)((double)(t.QuadPart - t0.QuadPart) / freq.QuadPart * 16000.0);
+            long long have = delivered + (long long)chunk.size();
+            while (g_sysRun && expected - have > 2 * CHUNK) { emit(0.f); have++; }
+        }
+        ac->Stop();
+    } while (0);
+    if (cap) cap->Release();
+    if (wfx) CoTaskMemFree(wfx);
+    if (ac) ac->Release();
+    if (dev) dev->Release();
+    if (en) en->Release();
+    g_ch[1].Flush();
+    CoUninitialize();
+}
+
+static void StartLoopback() {
+    if (g_loop.joinable()) { g_sysRun = false; g_loop.join(); }
+    g_ch[1] = Channel(1);
+    g_sysRun = true;
+    g_loop = std::thread(LoopbackLoop);
+}
+static void StopLoopback() {
+    g_sysRun = false;
+    if (g_loop.joinable()) g_loop.join();
+    SendMessageW(hLevel2, PBM_SETPOS, 0, 0);
 }
 
 static bool StartCapture(UINT dev) {
@@ -325,6 +596,7 @@ static bool StartCapture(UINT dev) {
     g_waveEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     MMRESULT r = waveInOpen(&g_wi, dev, &wf, (DWORD_PTR)g_waveEv, 0, CALLBACK_EVENT);
     if (r != MMSYSERR_NOERROR) { CloseHandle(g_waveEv); g_wi = nullptr; return false; }
+    g_ch[0] = Channel(0);
     for (int i = 0; i < NB; i++) {
         g_hdr[i] = WAVEHDR{};
         g_hdr[i].lpData = (LPSTR)g_bufs[i];
@@ -334,13 +606,15 @@ static bool StartCapture(UINT dev) {
     }
     g_capturing = true;
     waveInStart(g_wi);
-    g_capture = std::thread(CaptureLoop);
+    g_capture = std::thread(MicLoop);
+    if (g_sysOn) StartLoopback();
     return true;
 }
 
 static void StopCapture() {
     if (!g_wi) return;
     g_capturing = false;
+    StopLoopback();
     SetEvent(g_waveEv);
     if (g_capture.joinable()) g_capture.join();
     waveInStop(g_wi);
@@ -374,7 +648,7 @@ static void Layout(int w, int h) {
     MoveWindow(hTgtLbl, x, y + S(4), S(100), rowH, TRUE); x += S(100);
     MoveWindow(hTgt, x, y, cw, S(300), TRUE);
     y += rowH + m;
-    // row 3: buttons + level meter
+    // row 3: buttons + level meters (microphone on top, system audio below)
     int bw = S(90), bh = rowH + S(2);
     MoveWindow(hStart, m, y, bw, bh, TRUE);
     MoveWindow(hClear, m + bw + m, y, bw, bh, TRUE);
@@ -382,7 +656,8 @@ static void Layout(int w, int h) {
     MoveWindow(hCopyTr, m + 2 * (bw + m) + S(165) + m, y, S(165), bh, TRUE);
     MoveWindow(hSave, m + 2 * (bw + m) + 2 * (S(165) + m), y, bw + S(20), bh, TRUE);
     int lx = m + 2 * (bw + m) + 2 * (S(165) + m) + bw + S(20) + m;
-    MoveWindow(hLevel, lx, y + S(6), std::max(S(40), w - m - lx), S(14), TRUE);
+    MoveWindow(hLevel, lx, y + S(3), std::max(S(40), w - m - lx), S(10), TRUE);
+    MoveWindow(hLevel2, lx, y + S(16), std::max(S(40), w - m - lx), S(10), TRUE);
     y += bh + m;
     // rows 4-5: sound controls (gain / auto-gain / boost / noise suppression)
     int colW = S(190), slW = S(250), vW = S(90), x2 = m + colW + slW + vW + S(10);
@@ -394,7 +669,17 @@ static void Layout(int w, int h) {
     MoveWindow(hNs, m, y, colW, rowH, TRUE);
     MoveWindow(hNsStr, m + colW, y, slW, rowH, TRUE);
     MoveWindow(hNsVal, m + colW + slW + S(6), y + S(4), vW, rowH, TRUE);
-    MoveWindow(hBoost, x2, y, S(220), rowH, TRUE);
+    MoveWindow(hBoost, x2, y, S(260), rowH, TRUE);
+    y += rowH + m;
+    // rows 6-7: conversation mode (other side via system audio, speaker detection)
+    MoveWindow(hSysOn, m, y, S(300), rowH, TRUE);
+    MoveWindow(hRev, m + S(305), y, S(330), rowH, TRUE);
+    MoveWindow(hEcho, m + S(640), y, S(240), rowH, TRUE);
+    y += rowH + S(2);
+    MoveWindow(hOne, m, y, S(150), rowH, TRUE);
+    MoveWindow(hMany, m + S(155), y, S(210), rowH, TRUE);
+    MoveWindow(hSens, m + S(380), y, S(240), rowH, TRUE);
+    MoveWindow(hSensVal, m + S(626), y + S(4), S(80), rowH, TRUE);
     y += rowH + m;
     MoveWindow(hStatus, m, y, w - 2 * m, S(20), TRUE);
     y += S(24);
@@ -428,10 +713,22 @@ static bool WriteTextFile(const std::wstring& path, const std::wstring& text) {
     return ok;
 }
 
-// "Save..." writes both versions: <name>_<speech lang>.txt and <name>_<translation lang>.txt
+// The whole conversation in one language: what was said in it, plus the translation of what was said otherwise.
+static std::wstring DocumentIn(const std::string& key) {
+    std::wstring r;
+    for (auto& u : g_utts) {
+        const std::wstring* t = nullptr;
+        if (key == "orig" || u.oLang == key) t = &u.orig;
+        else if (u.tLang == key) t = &u.tr;
+        if (!t || t->empty()) continue;
+        r += (u.labeled ? L"[" + LabelOf(u.ch, u.spk) + L"] " : L"") + *t + L"\r\n";
+    }
+    return r;
+}
+
+// "Save..." writes both language versions: <name>_<lang>.txt for the speech language and for the translation language
 static void SaveDocuments(HWND hw) {
-    std::wstring src = g_committed + g_partial, tr = g_trCommitted + g_trPartial;
-    if (src.empty() && tr.empty()) { SetStatus(L"Nothing to save yet."); return; }
+    if (g_utts.empty()) { SetStatus(L"Nothing to save yet."); return; }
     SYSTEMTIME st; GetLocalTime(&st);
     wchar_t file[MAX_PATH];
     swprintf(file, MAX_PATH, L"Transcript_%04d-%02d-%02d_%02d-%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
@@ -445,18 +742,33 @@ static void SaveDocuments(HWND hw) {
     if (!GetSaveFileNameW(&o)) return;
     std::wstring base = file;
     if (base.size() > 4 && _wcsicmp(base.c_str() + base.size() - 4, L".txt") == 0) base.resize(base.size() - 4);
-    auto wcode = [](const std::string& c) { return std::wstring(c.begin(), c.end()); };
-    std::wstring a = base + L"_" + wcode(CodeOf(hLang, "orig")) + L".txt";
+    auto w = [](const std::string& c) { return std::wstring(c.begin(), c.end()); };
+    std::string sc = CodeOf(hLang, "auto"), tc = CodeOf(hTgt, "none");
+    std::string keyA = sc == "auto" ? "orig" : sc;
     std::wstring saved;
-    bool ok = WriteTextFile(a, src);
+    std::wstring a = base + L"_" + w(keyA) + L".txt";
+    bool ok = WriteTextFile(a, DocumentIn(keyA));
     if (ok) saved = a;
-    std::string tc = CodeOf(hTgt, "");
-    if (ok && !tc.empty() && !tr.empty()) {
-        std::wstring b = base + L"_" + wcode(tc) + L".txt";
-        ok = WriteTextFile(b, tr);
+    if (ok && tc != "none") {
+        std::wstring b = base + L"_" + w(tc) + L".txt";
+        ok = WriteTextFile(b, DocumentIn(tc));
         if (ok) saved += L"  and  " + b;
     }
     SetStatus(ok ? L"Saved: " + saved : L"Could not save the file.");
+}
+
+static void SetCheck(HWND h, bool on) { SendMessageW(h, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0); }
+
+static void StyleRich(HWND e, COLORREF bg) {
+    SendMessageW(e, EM_SETBKGNDCOLOR, 0, bg);
+    SendMessageW(e, EM_SETREADONLY, TRUE, 0);
+    CHARFORMAT2W cf{};
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR;
+    cf.yHeight = 14 * 20;   // 14 pt in twips
+    cf.crTextColor = RGB(30, 30, 30);
+    wcscpy(cf.szFaceName, L"Segoe UI");
+    SendMessageW(e, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
 }
 
 static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
@@ -470,7 +782,6 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         hBoldFont = CreateFontW(-MulDiv(10, g_dpi, 72), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        hTrBrush = CreateSolidBrush(RGB(238, 245, 255));
         hMicLbl = Mk(L"STATIC", L"Microphone:", 0, 0);
         hMic = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_MIC);
         hLangLbl = Mk(L"STATIC", L"Speech language:", 0, 0);
@@ -484,7 +795,9 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         hCopyTr = Mk(L"BUTTON", L"Copy translation", BS_PUSHBUTTON | WS_TABSTOP, ID_COPYTR);
         hSave = Mk(L"BUTTON", L"Save...", BS_PUSHBUTTON | WS_TABSTOP, ID_SAVE);
         hLevel = Mk(PROGRESS_CLASSW, L"", 0, ID_LEVEL);
+        hLevel2 = Mk(PROGRESS_CLASSW, L"", 0, ID_LEVEL2);
         SendMessageW(hLevel, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+        SendMessageW(hLevel2, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         hGainLbl = Mk(L"STATIC", L"Microphone gain:", 0, 0);
         hGain = Mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, ID_GAIN);
         SendMessageW(hGain, TBM_SETRANGE, TRUE, MAKELONG(-10, 30));
@@ -495,18 +808,28 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hNsStr, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
         hNsVal = Mk(L"STATIC", L"strength 50%", 0, 0);
         hBoost = Mk(L"BUTTON", L"Boost +12 dB (quiet sources)", BS_AUTOCHECKBOX | WS_TABSTOP, ID_BOOST);
+        hSysOn = Mk(L"BUTTON", L"Capture the other side (system audio)", BS_AUTOCHECKBOX | WS_TABSTOP, ID_SYS);
+        hRev = Mk(L"BUTTON", L"Other side speaks the translation language", BS_AUTOCHECKBOX | WS_TABSTOP, ID_REV);
+        hEcho = Mk(L"BUTTON", L"Speakers mode (echo filter)", BS_AUTOCHECKBOX | WS_TABSTOP, ID_ECHO);
+        hOne = Mk(L"BUTTON", L"One interlocutor", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, ID_ONE);
+        hMany = Mk(L"BUTTON", L"Several (detect voices)", BS_AUTORADIOBUTTON, ID_MANY);
+        hSens = Mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, ID_SENS);
+        SendMessageW(hSens, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
+        hSensVal = Mk(L"STATIC", L"60%", 0, 0);
         hStatus = Mk(L"STATIC", L"Starting the recognizer...", 0, ID_STATUS);
         hCapSrc = Mk(L"STATIC", L"Recognized speech", 0, 0);
-        hEdit = Mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, ID_EDIT, WS_EX_CLIENTEDGE);
+        LoadLibraryW(L"Msftedit.dll");
+        hEdit = Mk(L"RICHEDIT50W", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, ID_EDIT, WS_EX_CLIENTEDGE);
         hCapTr = Mk(L"STATIC", L"Translation", 0, 0);
-        hEditTr = Mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, ID_EDITTR, WS_EX_CLIENTEDGE);
+        hEditTr = Mk(L"RICHEDIT50W", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, ID_EDITTR, WS_EX_CLIENTEDGE);
         SendMessageW(hCapSrc, WM_SETFONT, (WPARAM)hBoldFont, TRUE);
         SendMessageW(hCapTr, WM_SETFONT, (WPARAM)hBoldFont, TRUE);
         SendMessageW(hSwap, WM_SETFONT, (WPARAM)hBigFont, TRUE);
-        for (HWND e : {hEdit, hEditTr}) {
-            SendMessageW(e, WM_SETFONT, (WPARAM)hBigFont, TRUE);
-            SendMessageW(e, EM_SETLIMITTEXT, 0x7FFFFFFF, 0);
-        }
+        for (HWND e : {hEdit, hEditTr}) SendMessageW(e, EM_SETLIMITTEXT, 0x7FFFFFFF, 0);
+        StyleRich(hEdit, RGB(255, 255, 255));
+        StyleRich(hEditTr, RGB(238, 245, 255));
+        g_src.h = hEdit;
+        g_tr.h = hEditTr;
 
         wchar_t exePath[MAX_PATH];
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -514,7 +837,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         g_ini = g_ini.substr(0, g_ini.find_last_of(L"\\/")) + L"\\settings.ini";
         if (GetFileAttributesW(g_ini.c_str()) == INVALID_FILE_ATTRIBUTES ||
             GetPrivateProfileIntW(L"app", L"v", 0, g_ini.c_str()) != 2) {
-            // a UTF-16 (BOM) ini keeps Cyrillic microphone names intact
+            // a UTF-16 (BOM) ini keeps non-ASCII microphone names intact
             int oldSrc = GetPrivateProfileIntW(L"app", L"src", -1, g_ini.c_str());
             int oldTgt = GetPrivateProfileIntW(L"app", L"tgt", -1, g_ini.c_str());
             HANDLE f = CreateFileW(g_ini.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -550,16 +873,18 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(hTgt, CB_SETITEMDATA, b, i);
         }
         // defaults: speech Russian -> translation English; then restore the saved choice
-        int srcSel = GetPrivateProfileIntW(L"app", L"src", 1, g_ini.c_str());
-        int tgtSel = GetPrivateProfileIntW(L"app", L"tgt", 2, g_ini.c_str());
+        auto geti = [](const wchar_t* k, int d) { return (int)GetPrivateProfileIntW(L"app", k, d, g_ini.c_str()); };
+        int srcSel = geti(L"src", 1), tgtSel = geti(L"tgt", 2);
         SendMessageW(hLang, CB_SETCURSEL, (srcSel >= 0 && srcSel <= NLANGS) ? srcSel : 1, 0);
         SendMessageW(hTgt, CB_SETCURSEL, (tgtSel >= 0 && tgtSel <= NLANGS) ? tgtSel : 2, 0);
-        SendMessageW(hGain, TBM_SETPOS, TRUE, (int)GetPrivateProfileIntW(L"app", L"gain", 10, g_ini.c_str()) - 10);
-        SendMessageW(hNsStr, TBM_SETPOS, TRUE, GetPrivateProfileIntW(L"app", L"nsv", 50, g_ini.c_str()));
-        SendMessageW(hNs, BM_SETCHECK, GetPrivateProfileIntW(L"app", L"ns", 1, g_ini.c_str()) ? BST_CHECKED : BST_UNCHECKED, 0);
-        SendMessageW(hAgc, BM_SETCHECK, GetPrivateProfileIntW(L"app", L"agc", 1, g_ini.c_str()) ? BST_CHECKED : BST_UNCHECKED, 0);
-        SendMessageW(hBoost, BM_SETCHECK, GetPrivateProfileIntW(L"app", L"boost", 0, g_ini.c_str()) ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(hGain, TBM_SETPOS, TRUE, geti(L"gain", 10) - 10);
+        SendMessageW(hNsStr, TBM_SETPOS, TRUE, geti(L"nsv", 50));
+        SetCheck(hNs, geti(L"ns", 1)); SetCheck(hAgc, geti(L"agc", 1)); SetCheck(hBoost, geti(L"boost", 0));
+        SetCheck(hSysOn, geti(L"sys", 0)); SetCheck(hRev, geti(L"rev", 1)); SetCheck(hEcho, geti(L"echo", 1));
+        SetCheck(hMany, geti(L"diar", 0)); SetCheck(hOne, !geti(L"diar", 0));
+        SendMessageW(hSens, TBM_SETPOS, TRUE, geti(L"sens", 60));
         UpdateFx(false);
+        UpdateConv(false);
         wchar_t savedMic[256];
         GetPrivateProfileStringW(L"app", L"mic", L"", savedMic, 256, g_ini.c_str());
         if (savedMic[0]) {
@@ -572,9 +897,10 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_HSCROLL:
         if ((HWND)lp == hGain || (HWND)lp == hNsStr) UpdateFx(LOWORD(wp) == TB_ENDTRACK);   // save when the drag ends
+        if ((HWND)lp == hSens) UpdateConv(LOWORD(wp) == TB_ENDTRACK);
         return 0;
     case WM_SIZE: Layout(LOWORD(lp), HIWORD(lp)); return 0;
-    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(860), S(600)}; return 0; }
+    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(860), S(700)}; return 0; }
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_START:
@@ -584,19 +910,25 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 int sel = (int)SendMessageW(hMic, CB_GETCURSEL, 0, 0);
                 UINT dev = (UINT)SendMessageW(hMic, CB_GETITEMDATA, sel, 0);
-                if (StartCapture(dev)) SetStatus(L"Listening... speak now.");
+                if (StartCapture(dev)) SetStatus(g_sysOn ? L"Listening to you and to the other side..." : L"Listening... speak now.");
                 else SetStatus(L"Could not open the microphone.");
             }
             UpdateUi();
             return 0;
         case ID_CLEAR:
-            g_committed.clear(); g_partial.clear(); g_trCommitted.clear(); g_trPartial.clear();
-            RefreshText(); RefreshTr();
+            PaneClear(g_src); PaneClear(g_tr);
+            g_utts.clear(); g_await[0].clear(); g_await[1].clear();
+            SendFrame('R', nullptr, 0);      // new conversation: forget the known voices
             return 0;
         case ID_SAVE: SaveDocuments(hw); return 0;
         case ID_NS: case ID_AGC: case ID_BOOST: UpdateFx(true); return 0;
+        case ID_REV: case ID_ECHO: case ID_ONE: case ID_MANY: UpdateConv(true); return 0;
+        case ID_SYS:
+            UpdateConv(true);
+            if (g_capturing) { if (g_sysOn) StartLoopback(); else StopLoopback(); }
+            return 0;
         case ID_COPY: case ID_COPYTR: {
-            std::wstring t = LOWORD(wp) == ID_COPY ? g_committed + g_partial : g_trCommitted + g_trPartial;
+            std::wstring t = PanePlain(LOWORD(wp) == ID_COPY ? g_src : g_tr);
             if (OpenClipboard(hw)) {
                 EmptyClipboard();
                 HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (t.size() + 1) * 2);
@@ -612,34 +944,41 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             if (s > 0 && t > 0) {
                 SendMessageW(hLang, CB_SETCURSEL, t, 0);
                 SendMessageW(hTgt, CB_SETCURSEL, s, 0);
-                g_trPartial.clear(); RefreshTr();
+                g_tr.has[0] = g_tr.has[1] = false; PaneRender(g_tr, nullptr);
                 SendLanguage(); SaveSettings();
             } else SetStatus(L"Swap works when both languages are concrete (not \"Auto\" and not \"No translation\").");
             return 0;
         }
         case ID_LANG: case ID_TGT: case ID_MIC:
             if (HIWORD(wp) == CBN_SELCHANGE) {
-                if (LOWORD(wp) != ID_MIC) { g_trPartial.clear(); RefreshTr(); SendLanguage(); }
+                if (LOWORD(wp) != ID_MIC) { g_tr.has[0] = g_tr.has[1] = false; PaneRender(g_tr, nullptr); SendLanguage(); }
                 SaveSettings();
             }
             return 0;
         }
         break;
-    case WM_CTLCOLORSTATIC:
-        if ((HWND)lp == hEdit) { SetBkColor((HDC)wp, RGB(255, 255, 255)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
-        if ((HWND)lp == hEditTr) { SetBkColor((HDC)wp, RGB(238, 245, 255)); return (LRESULT)hTrBrush; }
-        break;
     case WM_LEVEL: {
-        SendMessageW(hLevel, PBM_SETPOS, wp, 0);
-        static int lastSpeaking = -1;
-        if (g_capturing && (int)lp != lastSpeaking) {   // live feedback: is the speech detector hearing you?
-            lastSpeaking = (int)lp;
-            SetStatus(lp ? L"Hearing speech..." : L"Listening... speak now.");
+        int ch = (int)(lp >> 1) & 1;
+        SendMessageW(ch ? hLevel2 : hLevel, PBM_SETPOS, wp, 0);
+        static int speaking[2] = {0, 0}, shown = -1;
+        speaking[ch] = (int)lp & 1;
+        int state = speaking[0] | (speaking[1] << 1);
+        if (g_capturing && state != shown) {   // live feedback: which side does the speech detector hear?
+            shown = state;
+            SetStatus(state == 0 ? (g_sysOn ? L"Listening to you and to the other side..." : L"Listening... speak now.")
+                      : state == 1 ? L"Hearing you..." : state == 2 ? L"Hearing the other side..." : L"Hearing both sides...");
         }
+        return 0;
+    }
+    case WM_SYSERR: {
+        std::unique_ptr<std::wstring> m((std::wstring*)lp);
+        g_sysRun = false;
+        SetStatus(L"System audio capture failed: " + *m + L". Microphone capture continues.");
         return 0;
     }
     case WM_WORKER: {
         std::unique_ptr<WorkerMsg> m((WorkerMsg*)lp);
+        int ch = m->ch & 1;
         switch (m->kind) {
         case 'S':
             if (m->text.rfind(L"ready", 0) == 0) {
@@ -656,18 +995,41 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             EnableWindow(hTgt, FALSE); EnableWindow(hSwap, FALSE);
             SaveSettings();
             break;
-        case 'P': g_partial = m->text; RefreshText(); break;
-        case 'F':
-            if (!m->text.empty()) g_committed += m->text + L"\r\n";
-            g_partial.clear();
-            RefreshText();
+        case 'V':  // speaker detection engine unavailable
+            g_spkAvailable = false;
+            SetCheck(hMany, false); SetCheck(hOne, true);
+            EnableWindow(hMany, FALSE);
+            UpdateConv(true);
             break;
-        case 'T': g_trPartial = m->text; RefreshTr(); break;
-        case 'U':
-            if (!m->text.empty()) g_trCommitted += m->text + L"\r\n";
-            g_trPartial.clear();
-            RefreshTr();
+        case 'P': {
+            Entry e{ch, m->spk, Labeled(), m->text};
+            PaneSetLive(g_src, ch, e);
             break;
+        }
+        case 'F': {
+            if (m->text.empty()) { g_await[ch].push_back(-1); PaneClearLive(g_src, ch); break; }
+            Entry e{ch, m->spk, Labeled(), m->text};
+            Utt u{ch, m->spk, e.labeled, m->text, L"", m->lang, ""};
+            g_utts.push_back(u);
+            g_await[ch].push_back((int)g_utts.size() - 1);
+            PaneCommit(g_src, e);
+            break;
+        }
+        case 'T': {
+            Entry e{ch, m->spk, Labeled(), m->text};
+            PaneSetLive(g_tr, ch, e);
+            break;
+        }
+        case 'U': {
+            int idx = -1;
+            if (!g_await[ch].empty()) { idx = g_await[ch].front(); g_await[ch].pop_front(); }
+            if (idx >= 0 && idx < (int)g_utts.size() && !m->text.empty()) {
+                g_utts[idx].tr = m->text;
+                g_utts[idx].tLang = m->lang;
+                PaneCommit(g_tr, Entry{ch, g_utts[idx].spk, g_utts[idx].labeled, m->text});
+            } else PaneClearLive(g_tr, ch);
+            break;
+        }
         case 'X':
             g_ready = false;
             if (g_capturing) StopCapture();
@@ -699,9 +1061,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     wc.lpszClassName = L"VoiceWindow";
     RegisterClassW(&wc);
     HDC dc = GetDC(nullptr); int dpi = GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(nullptr, dc);
-    // WS_EX_TOPMOST: always above other windows; it leaves only when minimized with the "–" button
+    // WS_EX_TOPMOST: always above other windows; it leaves only when minimized with the "-" button
     HWND w = CreateWindowExW(WS_EX_TOPMOST, L"VoiceWindow", L"Voice Recognition and Translation", WS_OVERLAPPEDWINDOW,
-                             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(860, dpi, 96), MulDiv(860, dpi, 96),
+                             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(960, dpi, 96),
                              nullptr, nullptr, hInst, nullptr);
     ShowWindow(w, show);
     MSG m;

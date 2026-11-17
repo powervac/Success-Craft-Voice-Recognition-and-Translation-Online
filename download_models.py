@@ -21,4 +21,11 @@ print("Downloading Whisper %s ..." % whisper)
 print(download_model(whisper, cache_dir=os.path.join(root, "hf")))
 print("Downloading NLLB-200 distilled 1.3B (CTranslate2, int8) ...")
 print(snapshot_download("OpenNMT/nllb-200-distilled-1.3B-ct2-int8", cache_dir=os.path.join(root, "hf")))
+print("Downloading the speaker-embedding model (26 MB) ...")
+import urllib.request
+spk_dir = os.path.join(root, "speaker")
+os.makedirs(spk_dir, exist_ok=True)
+spk = os.path.join(spk_dir, "wespeaker_en_voxceleb_resnet34_LM.onnx")
+if not os.path.isfile(spk):
+    urllib.request.urlretrieve("https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx", spk)
 print("Done. Models are in", os.path.join(root, "hf"))

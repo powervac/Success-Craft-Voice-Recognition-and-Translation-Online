@@ -5,6 +5,7 @@ ctranslate2>=4.5           # inference engine for both Whisper and NLLB
 tokenizers>=0.20           # NLLB tokenizer
 huggingface_hub>=0.30      # model download
 numpy>=1.26
+sherpa-onnx>=1.12      # speaker embeddings (detect several interlocutors)
 # CUDA 12 runtime libraries for GPU inference (not needed for CPU-only use):
 nvidia-cublas-cu12
 nvidia-cudnn-cu12==9.*
