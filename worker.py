@@ -22,7 +22,6 @@ os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
 
 RATE = 16000
 MODEL = os.environ.get('DICTATE_MODEL', 'large-v3')
-NLLB_REPO = 'OpenNMT/nllb-200-distilled-1.3B-ct2-int8'
 NLLB = {'ru': 'rus_Cyrl', 'en': 'eng_Latn', 'de': 'deu_Latn', 'fr': 'fra_Latn', 'es': 'spa_Latn',
         'uk': 'ukr_Cyrl', 'pl': 'pol_Latn', 'it': 'ita_Latn'}
 MAX_SPEAKERS = 6
@@ -127,7 +126,7 @@ except Exception as e:
     sys.stderr.write('model pre-download failed: %r\n' % (e,))
 
 try:
-    model = WhisperModel(model_ref, device='cuda', compute_type='float16', download_root=os.path.join(ROOT, 'hf'))
+    model = WhisperModel(model_ref, device='cuda', compute_type='int8_float16', download_root=os.path.join(ROOT, 'hf'))
     dev = 'GPU'
 except Exception as e:
     sys.stderr.write('GPU failed: %r\n' % (e,))
@@ -135,25 +134,97 @@ except Exception as e:
     model = WhisperModel(model_ref, device='cpu', compute_type='int8', download_root=os.path.join(ROOT, 'hf'))
     dev = 'CPU'
 
-# ---- translation engine (NLLB-200 via CTranslate2), optional ----
+# ---- translation engines (CTranslate2), selectable from the UI ----
+TR_MODELS = [   # id, label, repo, size in MB, kind
+    ('nllb13', 'NLLB 1.3B - fast (default)', 'OpenNMT/nllb-200-distilled-1.3B-ct2-int8', 1400, 'nllb'),
+    ('nllb33', 'NLLB 3.3B - better', 'OpenNMT/nllb-200-3.3B-ct2-int8', 3400, 'nllb'),
+    ('madlad3b', 'MADLAD-400 3B - best, fluent text', 'Nextcloud-AI/madlad400-3b-mt-ct2-int8', 3000, 'madlad'),
+]
 translator = tok = None
-try:
-    send('S', 'Loading the NLLB translation model...')
+tr_id, tr_kind = None, 'nllb'
+tr_lock = threading.Lock()
+tr_loading, tr_pending = False, None
+import dl_progress
+
+
+def tr_cached(repo):
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo, cache_dir=os.path.join(ROOT, 'hf'), local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
+def send_tr_catalog():
+    for i, (mid, label, repo, mb, kind) in enumerate(TR_MODELS):
+        send('K', i, mid, label, mb, 1 if tr_cached(repo) else 0)
+
+
+def load_translator(mid):
+    """Download (with progress) and activate a translation model; falls back to the CPU if the GPU is full."""
+    global translator, tok, tr_id, tr_kind, cache
+    entry = next((m for m in TR_MODELS if m[0] == mid), None)
+    if entry is None:
+        return
     import ctranslate2
     from tokenizers import Tokenizer
-    import dl_progress
-    path = dl_progress.fetch(NLLB_REPO, os.path.join(ROOT, 'hf'), 'Translation model (NLLB)', send)
-    tok = Tokenizer.from_file(os.path.join(path, 'tokenizer.json'))
+    path = dl_progress.fetch(entry[2], os.path.join(ROOT, 'hf'), 'Translation model ' + entry[1].split(' -')[0], send)
+    new_tok = Tokenizer.from_file(os.path.join(path, 'tokenizer.json'))
+    translator = None                                    # free the old model before loading the new one
+    import gc
+    gc.collect()
     try:
-        translator = ctranslate2.Translator(path, device='cuda' if dev == 'GPU' else 'cpu',
-                                            compute_type='int8_float16' if dev == 'GPU' else 'int8')
+        new_tr = ctranslate2.Translator(path, device='cuda' if dev == 'GPU' else 'cpu',
+                                        compute_type='int8_float16' if dev == 'GPU' else 'int8')
     except Exception as e:
-        sys.stderr.write('translator on GPU failed: %r\n' % (e,))
-        translator = ctranslate2.Translator(path, device='cpu', compute_type='int8')
+        sys.stderr.write('translator on GPU failed: %r' % (e,) + chr(10))
+        send('S', 'Not enough GPU memory for this translation model - using the CPU (slower).')
+        new_tr = ctranslate2.Translator(path, device='cpu', compute_type='int8')
+    translator, tok, tr_id, tr_kind = new_tr, new_tok, mid, entry[4]
+    cache = {}
+    send('Z', mid)
+    send_tr_catalog()
+
+
+def switch_translator(mid):
+    global tr_loading, tr_pending
+    with tr_lock:
+        if tr_loading:
+            tr_pending = mid
+            return
+        tr_loading = True
+
+    def run(m):
+        global tr_loading, tr_pending
+        while m:
+            try:
+                if m != tr_id:
+                    load_translator(m)
+            except Exception as e:
+                sys.stderr.write('translation model error: %r' % (e,) + chr(10))
+                send('D', -1, '')
+                send('S', 'Could not load the translation model: %s' % (e,))
+                send('Z', tr_id or '')
+            with tr_lock:
+                m, tr_pending = tr_pending, None
+                if not m:
+                    tr_loading = False
+
+    threading.Thread(target=run, args=(mid,), daemon=True).start()
+
+
+try:
+    initial_tr = os.environ.get('TRANSLATION_MODEL') or 'nllb13'
+    if not any(m[0] == initial_tr for m in TR_MODELS):
+        initial_tr = 'nllb13'
+    send('S', 'Loading the translation model...')
+    load_translator(initial_tr)
 except Exception as e:
-    sys.stderr.write('translation unavailable: %r\n' % (e,))
+    sys.stderr.write('translation unavailable: %r' % (e,) + chr(10))
     translator = None
     send('N', 'Translation model unavailable: %s' % (e,))
+    send_tr_catalog()
 
 # ---- speaker embedding models (sherpa-onnx), selectable from the UI ----
 SPK_BASE = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/'
@@ -630,22 +701,32 @@ def make_runs(c, audio, items, final, words=None):
 
 
 def translate(text, s, t, final):
-    """Sentence-by-sentence NLLB translation (whole-paragraph input makes NLLB drop sentences)."""
-    if not translator or not text or t == 'none' or s == t or s not in NLLB or t not in NLLB:
+    """Sentence-by-sentence translation (whole paragraphs make the models drop sentences)."""
+    tr, tk, kind, mid = translator, tok, tr_kind, tr_id        # a model switch may happen meanwhile
+    if not tr or not text or t == 'none' or s == t or s not in NLLB or t not in NLLB:
         return text if (s == t and t != 'none') else ''
-    sents = [x for x in re.split(r'(?<=[.!?…])\s+', text) if x.strip()]
-    todo = [x for x in sents if (s, t, final, x) not in cache]
+    sents = [x for x in re.split(r'(?<=[.!?\u2026])\s+', text) if x.strip()]
+    todo = [x for x in sents if (mid, s, t, final, x) not in cache]
     if todo:
-        batch = [[NLLB[s]] + tok.encode(x, add_special_tokens=False).tokens + ['</s>'] for x in todo]
-        res = translator.translate_batch(batch, target_prefix=[[NLLB[t]]] * len(batch),
-                                         beam_size=4 if final else 1, max_decoding_length=256,
-                                         repetition_penalty=1.1, no_repeat_ngram_size=4)
-        for x, r in zip(todo, res):
-            ids = [tok.token_to_id(p) for p in r.hypotheses[0][1:]]
-            cache[(s, t, final, x)] = tok.decode([i for i in ids if i is not None], skip_special_tokens=True).strip()
+        beam = 4 if final else 1
+        if kind == 'madlad':
+            batch = []
+            for x in todo:
+                tokens = tk.encode('<2%s> %s' % (t, x)).tokens
+                batch.append(tokens if tokens[-1] == '</s>' else tokens + ['</s>'])
+            res = tr.translate_batch(batch, beam_size=beam, max_decoding_length=256)
+            outs = [r.hypotheses[0] for r in res]
+        else:
+            batch = [[NLLB[s]] + tk.encode(x, add_special_tokens=False).tokens + ['</s>'] for x in todo]
+            res = tr.translate_batch(batch, target_prefix=[[NLLB[t]]] * len(batch), beam_size=beam,
+                                     max_decoding_length=256, repetition_penalty=1.1, no_repeat_ngram_size=4)
+            outs = [r.hypotheses[0][1:] for r in res]
+        for x, toks in zip(todo, outs):
+            ids = [tk.token_to_id(p) for p in toks]
+            cache[(mid, s, t, final, x)] = tk.decode([i for i in ids if i is not None], skip_special_tokens=True).strip()
         if len(cache) > 2000:
             cache.clear()
-    return ' '.join(cache[(s, t, final, x)] for x in sents)
+    return ' '.join(cache[(mid, s, t, final, x)] for x in sents)
 
 
 def pick():
@@ -759,6 +840,8 @@ try:
                         pass
         elif t == 'M':
             switch_speaker(payload.decode('utf-8', 'ignore'))
+        elif t == 'G':
+            switch_translator(payload.decode('utf-8', 'ignore'))
         elif t == 'R':
             with cond:
                 for c in chans:
