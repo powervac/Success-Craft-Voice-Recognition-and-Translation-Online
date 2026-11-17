@@ -1,0 +1,10 @@
+# build output and local state
+*.exe
+*.o
+settings.ini
+worker.log
+# Python environment and downloaded models
+venv/
+data/
+__pycache__/
+*.pyc

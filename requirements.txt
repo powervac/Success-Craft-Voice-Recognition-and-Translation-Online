@@ -1,0 +1,10 @@
+# Runtime dependencies of worker.py (speech recognition + translation engine).
+# Pinned, known-good versions are in requirements-lock.txt.
+faster-whisper>=1.2.0      # Whisper speech recognition on CTranslate2 (also pulls in ctranslate2, onnxruntime, av, tokenizers)
+ctranslate2>=4.5           # inference engine for both Whisper and NLLB
+tokenizers>=0.20           # NLLB tokenizer
+huggingface_hub>=0.30      # model download
+numpy>=1.26
+# CUDA 12 runtime libraries for GPU inference (not needed for CPU-only use):
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*
