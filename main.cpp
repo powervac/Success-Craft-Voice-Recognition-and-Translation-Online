@@ -1411,8 +1411,8 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             HDC dc = d->hDC;
             RECT r = d->rcItem;
             bool attn = !g_active && !g_capturing, dis = (d->itemState & ODS_DISABLED) != 0, down = (d->itemState & ODS_SELECTED) != 0;
-            COLORREF bg = dis ? RGB(228, 228, 228) : attn ? (down ? RGB(29, 78, 216) : RGB(37, 99, 235)) : (down ? RGB(205, 205, 205) : RGB(238, 238, 238));
-            COLORREF edge = dis ? RGB(190, 190, 190) : attn ? RGB(29, 78, 216) : RGB(140, 140, 140);
+            COLORREF bg = dis ? RGB(228, 228, 228) : attn ? (down ? RGB(235, 140, 0) : RGB(255, 175, 40)) : (down ? RGB(205, 205, 205) : RGB(238, 238, 238));
+            COLORREF edge = dis ? RGB(190, 190, 190) : attn ? RGB(200, 100, 0) : RGB(140, 140, 140);
             HBRUSH bb = CreateSolidBrush(bg);
             HPEN pen = CreatePen(PS_SOLID, 1, edge);
             HGDIOBJ op = SelectObject(dc, pen), ob = SelectObject(dc, bb);
