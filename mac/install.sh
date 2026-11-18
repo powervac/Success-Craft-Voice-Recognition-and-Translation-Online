@@ -57,5 +57,9 @@ case ":$PATH:" in
 esac
 
 echo
-echo "Done. Start it with:  voice-recognition   (or open it from Applications)"
-echo "On the first start it sets itself up (a private Python, packages and models, a few GB; internet needed)."
+echo "Installed. Starting the program now - its window opens in a few seconds."
+echo "  - The first start sets itself up (Python, packages, speech models: a few GB, 10-30 minutes)."
+echo "    The progress is shown at the bottom of the window. Keep it open and the Mac awake."
+echo "  - When it says Ready: press \"+ New session\", then Record, and allow the microphone."
+echo "  - Next time start it from Applications or with:  voice-recognition"
+open "$DEST/$APP_NAME" || echo "Could not open it automatically: open \"$APP_NAME\" from Applications."
