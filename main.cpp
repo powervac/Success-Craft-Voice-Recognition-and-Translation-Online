@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,7 +37,7 @@
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
        ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
-       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL, ID_TRMODEL, ID_HIST };
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL, ID_TRMODEL, ID_SIDELIST, ID_SPIN };
 enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
@@ -49,13 +50,17 @@ static const int NLANGS = sizeof(LANGS) / sizeof(LANGS[0]);
 static std::atomic<int> g_gainDb{0}, g_ns{1}, g_nsStr{50}, g_agc{1}, g_boost{0};
 static std::atomic<int> g_sysOn{0}, g_rev{1}, g_echo{0}, g_diar{0}, g_sens{60}, g_micOn{1};
 static void EndSession();
+static HWND hSpin;                                    // round spinner: the program is busy loading, it has not hung
+static int g_spinStep = 0;
+static bool g_busy = true;                           // true from the start until the recognizer is ready (or has failed)
+static bool g_switching = false;                     // a speaker / translation model is being switched
 static std::atomic<long long> g_sysLastSpeechMs{0};   // for the speaker-echo filter
 
 // ---- window handles and state ----
 static HWND hMain, hMicLbl, hMic, hLang, hStart, hClear, hCopy, hLevel, hLevel2, hStatus, hEdit;
 static HWND hGainLbl, hGain, hGainVal, hAgc, hNs, hNsStr, hNsVal, hBoost;
 static HWND hSysOn, hRev, hEcho, hOne, hMany, hSens, hSensVal;
-static HWND hSysLbl, hSysDev, hProg, hMicOn, hSpkLbl, hSpkModel, hTrmLbl, hTrModel, hHist, hHistWnd;
+static HWND hSysLbl, hSysDev, hProg, hMicOn, hSpkLbl, hSpkModel, hTrmLbl, hTrModel;
 struct SpkModel { std::wstring id, label; int mb = 0; bool present = false; };
 static std::vector<SpkModel> g_spk;             // catalog sent by the worker
 static std::wstring g_spkActive, g_spkWanted;   // model in use / model chosen in the UI
@@ -217,6 +222,12 @@ static bool StartWorker() {
 //  First-run bootstrap: find (or install) Python, create the virtual environment.
 //  Python packages and models are then checked / installed by worker.py itself on every start.
 // =====================================================================================
+static void PostError(const std::wstring& t) {
+    auto* m = new WorkerMsg();
+    m->kind = 'E';
+    m->text = t;
+    PostMessageW(hMain, WM_WORKER, 0, (LPARAM)m);
+}
 static void PostStatus(const std::wstring& t) {
     auto* m = new WorkerMsg();
     m->kind = 'S';
@@ -226,6 +237,7 @@ static void PostStatus(const std::wstring& t) {
 
 // Runs a command without a window and returns its exit code (-1 if it could not start, -2 on timeout).
 static void PostStatus(const std::wstring& t);
+static void PostError(const std::wstring& t);
 static int RunHidden(const std::wstring& cmdline, DWORD timeoutMs, const wchar_t* label = nullptr) {
     STARTUPINFOW si{};
     si.cb = sizeof si;
@@ -290,17 +302,17 @@ static void BootstrapThread() {
             sys = FindSystemPython();
         }
         if (sys.empty()) {
-            PostStatus(L"Python 3.10+ is required. Install it from python.org (tick \"Add python.exe to PATH\") and start the app again.");
+            PostError(L"Python 3.10+ is required. Install it from python.org (tick \"Add python.exe to PATH\") and start the app again.");
             return;
         }
         PostStatus(L"Creating the Python environment (one time)...");
         if (RunHidden(L"\"" + sys + L"\" -m venv \"" + dir + L"\\venv\"", 10 * 60 * 1000, L"Creating the Python environment (one time):") != 0 || !FileExists(venvPy)) {
-            PostStatus(L"Could not create the Python environment (venv folder next to the program).");
+            PostError(L"Could not create the Python environment (venv folder next to the program).");
             return;
         }
     }
     PostStatus(L"Starting the recognizer (missing packages and models are installed automatically)...");
-    if (!StartWorker()) PostStatus(L"Could not start Python. Run setup.ps1 or set [paths] python= in settings.ini.");
+    if (!StartWorker()) PostError(L"Could not start Python. Run setup.ps1 or set [paths] python= in settings.ini.");
 }
 
 // =====================================================================================
@@ -804,9 +816,13 @@ static std::wstring Stamp() {
 static HANDLE g_sess = INVALID_HANDLE_VALUE;
 static std::wstring g_sessPath;
 
+static void DropEmptySession(const std::wstring& path);
 static void EndSession() {
-    if (g_sess != INVALID_HANDLE_VALUE) CloseHandle(g_sess);
-    g_sess = INVALID_HANDLE_VALUE;
+    if (g_sess != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_sess);
+        g_sess = INVALID_HANDLE_VALUE;
+        DropEmptySession(g_sessPath);            // a record in which nothing was said is not kept
+    }
     g_sessPath.clear();
 }
 static std::string CleanU8(const std::wstring& w) {
@@ -817,23 +833,17 @@ static std::string CleanU8(const std::wstring& w) {
     if (n) WideCharToMultiByte(CP_UTF8, 0, c.data(), (int)c.size(), &u[0], n, nullptr, nullptr);
     return u;
 }
+static void BeginSession();
+static void SessionCounted();
 static void SessionAppend(const Utt& u) {
-    if (g_sess == INVALID_HANDLE_VALUE) {
-        std::wstring dir = ExeDir() + L"\\history";
-        CreateDirectoryW(dir.c_str(), nullptr);
-        std::wstring stamp = Stamp();
-        g_sessPath = dir + L"\\" + stamp + L".txt";
-        g_sess = CreateFileW(g_sessPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (g_sess == INVALID_HANDLE_VALUE) return;
-        std::string head = "#V1\t" + CleanU8(stamp) + "\n";
-        DWORD w;
-        WriteFile(g_sess, head.data(), (DWORD)head.size(), &w, nullptr);
-    }
+    if (g_sess == INVALID_HANDLE_VALUE) BeginSession();
+    if (g_sess == INVALID_HANDLE_VALUE) return;
     std::string line = "U\t" + std::to_string(u.ch) + "\t" + std::to_string(u.spk) + "\t" + (u.labeled ? "1" : "0") + "\t" +
                        u.oLang + "\t" + u.tLang + "\t" + CleanU8(u.orig) + "\t" + CleanU8(u.tr) + "\n";
     DWORD w;
     WriteFile(g_sess, line.data(), (DWORD)line.size(), &w, nullptr);
     FlushFileBuffers(g_sess);                   // the history survives a crash
+    SessionCounted();
 }
 
 static std::wstring ReadU8File(const std::wstring& path) {
@@ -907,25 +917,29 @@ static void LoadSession(const std::wstring& path) {
     SetStatus(L"Loaded a session from the history (" + std::to_wstring(n) + L" lines).");
 }
 
-static std::wstring SessionPreview(const HistSession& h) {
-    std::wstring r = L"Started: " + h.stamp + L"\r\n";
-    r += L"\r\n";
-    for (auto& raw : SplitOn(ReadU8File(h.path), L'\n')) {
-        std::wstring ln = raw;
-        if (!ln.empty() && ln.back() == L'\r') ln.pop_back();
-        Utt u;
-        if (!ParseUtt(ln, u)) continue;
-        r += (u.labeled ? L"[" + LabelOf(u.ch, u.spk) + L"] " : L"") + u.orig + L"\r\n";
-        if (!u.tr.empty()) r += L"      \u2192 " + u.tr + L"\r\n";
-    }
-    return r;
+// ---- the sessions sidebar: every record (session) with its date and time ----
+static HWND hSideLbl, hSideList;
+static bool g_sideBusy = false;                 // ignore selection events caused by our own list updates
+
+static std::wstring SessionTitle(const HistSession& h) {
+    std::wstring d = h.stamp.size() >= 10 ? h.stamp.substr(0, 10) : h.stamp;
+    std::wstring t = h.stamp.size() >= 19 ? h.stamp.substr(11, 8) : L"";
+    for (auto& c : t) if (c == L'-') c = L':';
+    bool live = g_capturing && !g_sessPath.empty() && h.path == g_sessPath;
+    return (live ? L"\u25CF " : L"") + d + L"   " + t + L"   (" + std::to_wstring(h.lines) + L")";
 }
-
-// ---- the History window ----
-enum { HID_LIST = 301, HID_PREV, HID_LOAD, HID_DEL, HID_FOLDER, HID_CLOSE };
-static HWND hhList, hhPrev, hhLoad, hhDel, hhFolder, hhClose;
-
-static void HistRefresh() {
+static void SideFill(int select) {              // rebuild the list; select >= 0 marks that item without loading it
+    g_sideBusy = true;
+    SendMessageW(hSideList, LB_RESETCONTENT, 0, 0);
+    for (auto& h : g_hs) SendMessageW(hSideList, LB_ADDSTRING, 0, (LPARAM)SessionTitle(h).c_str());
+    if (select >= 0 && select < (int)g_hs.size()) SendMessageW(hSideList, LB_SETCURSEL, select, 0);
+    g_sideBusy = false;
+}
+static int SideIndexOf(const std::wstring& path) {
+    for (size_t i = 0; i < g_hs.size(); i++) if (g_hs[i].path == path) return (int)i;
+    return -1;
+}
+static void SideRefresh() {                     // scan history\*.txt, newest first
     g_hs.clear();
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((ExeDir() + L"\\history\\*.txt").c_str(), &fd);
@@ -934,92 +948,82 @@ static void HistRefresh() {
         FindClose(h);
     }
     std::sort(g_hs.begin(), g_hs.end(), [](const HistSession& a, const HistSession& b) { return a.stamp > b.stamp; });
-    SendMessageW(hhList, LB_RESETCONTENT, 0, 0);
-    for (auto& s : g_hs) {
-        std::wstring t = s.stamp + L"   (" + std::to_wstring(s.lines) + L" lines)" + L"   " + s.first;
-        SendMessageW(hhList, LB_ADDSTRING, 0, (LPARAM)t.c_str());
-    }
-    if (!g_hs.empty()) SendMessageW(hhList, LB_SETCURSEL, 0, 0);
-    SetWindowTextW(hhPrev, g_hs.empty() ? L"No saved sessions yet. Every session is saved here automatically while you listen." : SessionPreview(g_hs[0]).c_str());
+    SideFill(-1);
 }
-
+static void DropEmptySession(const std::wstring& path) {
+    int i = SideIndexOf(path);
+    if (i >= 0 && g_hs[i].lines == 0) {
+        DeleteFileW(path.c_str());
+        g_hs.erase(g_hs.begin() + i);
+        SideFill(-1);
+    }
+}
+static void BeginSession() {                    // a new record: its date and time appear in the sidebar at once
+    EndSession();
+    std::wstring dir = ExeDir() + L"\\history";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring stamp = Stamp(), path = dir + L"\\" + stamp + L".txt";
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    std::string head = "#V1\t" + CleanU8(stamp) + "\n";
+    DWORD w;
+    WriteFile(f, head.data(), (DWORD)head.size(), &w, nullptr);
+    g_sess = f;
+    g_sessPath = path;
+    HistSession h;
+    h.path = path;
+    h.stamp = stamp;
+    g_hs.insert(g_hs.begin(), h);
+    SideFill(0);
+}
+static void SessionCounted() {                  // one more line in the current record
+    int i = SideIndexOf(g_sessPath);
+    if (i < 0) return;
+    g_hs[i].lines++;
+    g_sideBusy = true;
+    int sel = (int)SendMessageW(hSideList, LB_GETCURSEL, 0, 0);
+    SendMessageW(hSideList, LB_DELETESTRING, i, 0);
+    SendMessageW(hSideList, LB_INSERTSTRING, i, (LPARAM)SessionTitle(g_hs[i]).c_str());
+    if (sel >= 0) SendMessageW(hSideList, LB_SETCURSEL, sel, 0);
+    g_sideBusy = false;
+}
 static void OpenFolder(const std::wstring& name) {
     std::wstring dir = ExeDir() + L"\\" + name;
     CreateDirectoryW(dir.c_str(), nullptr);
     ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
-
-static LRESULT CALLBACK HistProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_CREATE: {
-        auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int id, DWORD ex = 0) {
-            HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, 0, 0, 10, 10, hw, (HMENU)(INT_PTR)id, nullptr, nullptr);
-            SendMessageW(c, WM_SETFONT, (WPARAM)hFont, TRUE);
-            return c;
-        };
-        hhList = mk(L"LISTBOX", L"", LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP, HID_LIST, WS_EX_CLIENTEDGE);
-        hhPrev = mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, HID_PREV, WS_EX_CLIENTEDGE);
-        hhLoad = mk(L"BUTTON", L"Load into the window", BS_PUSHBUTTON | WS_TABSTOP, HID_LOAD);
-        hhDel = mk(L"BUTTON", L"Delete", BS_PUSHBUTTON | WS_TABSTOP, HID_DEL);
-        hhFolder = mk(L"BUTTON", L"Open history folder", BS_PUSHBUTTON | WS_TABSTOP, HID_FOLDER);
-        hhClose = mk(L"BUTTON", L"Close", BS_PUSHBUTTON | WS_TABSTOP, HID_CLOSE);
-        HistRefresh();
-        return 0;
-    }
-    case WM_SIZE: {
-        int w = LOWORD(lp), h = HIWORD(lp), m = S(10), bh = S(30), lw = std::max(S(260), w * 38 / 100);
-        MoveWindow(hhList, m, m, lw, h - 3 * m - bh, TRUE);
-        MoveWindow(hhPrev, 2 * m + lw, m, w - 3 * m - lw, h - 3 * m - bh, TRUE);
-        int y = h - m - bh, x = m;
-        MoveWindow(hhLoad, x, y, S(170), bh, TRUE); x += S(180);
-        MoveWindow(hhDel, x, y, S(90), bh, TRUE); x += S(100);
-        MoveWindow(hhFolder, x, y, S(170), bh, TRUE);
-        MoveWindow(hhClose, w - m - S(90), y, S(90), bh, TRUE);
-        return 0;
-    }
-    case WM_GETMINMAXINFO: { auto* mm = (MINMAXINFO*)lp; mm->ptMinTrackSize = {S(820), S(420)}; return 0; }
-    case WM_COMMAND: {
-        int sel = (int)SendMessageW(hhList, LB_GETCURSEL, 0, 0);
-        bool ok = sel >= 0 && sel < (int)g_hs.size();
-        switch (LOWORD(wp)) {
-        case HID_LIST:
-            if (HIWORD(wp) == LBN_SELCHANGE && ok) SetWindowTextW(hhPrev, SessionPreview(g_hs[sel]).c_str());
-            if (HIWORD(wp) == LBN_DBLCLK && ok) { LoadSession(g_hs[sel].path); DestroyWindow(hw); }
-            return 0;
-        case HID_LOAD: if (ok) { LoadSession(g_hs[sel].path); DestroyWindow(hw); } return 0;
-        case HID_DEL:
-            if (ok && MessageBoxW(hw, L"Delete this session from the history?\n(Audio recordings are not deleted.)", L"History",
-                                  MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                if (g_hs[sel].path == g_sessPath) EndSession();
-                DeleteFileW(g_hs[sel].path.c_str());
-                HistRefresh();
-            }
-            return 0;
-        case HID_FOLDER: OpenFolder(L"history"); return 0;
-        case HID_CLOSE: DestroyWindow(hw); return 0;
-        }
-        break;
-    }
-    case WM_CLOSE: DestroyWindow(hw); return 0;
-    case WM_DESTROY: hHistWnd = nullptr; return 0;
-    }
-    return DefWindowProcW(hw, msg, wp, lp);
+static void OpenSession(int i) {                // show a saved record in the two panels
+    if (i < 0 || i >= (int)g_hs.size() || g_capturing) return;
+    std::wstring path = g_hs[i].path;
+    LoadSession(path);
+    SideFill(SideIndexOf(path));
 }
-
-static void OpenHistory() {
-    if (hHistWnd) { ShowWindow(hHistWnd, SW_RESTORE); SetForegroundWindow(hHistWnd); HistRefresh(); return; }
-    hHistWnd = CreateWindowExW(WS_EX_TOPMOST, L"VoiceHistory", L"History", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
-                               S(920), S(580), hMain, nullptr, GetModuleHandleW(nullptr), nullptr);
+static void DeleteSessionAt(HWND owner, int i) {
+    if (i < 0 || i >= (int)g_hs.size()) return;
+    if (MessageBoxW(owner, L"Delete this record from the history?", L"Sessions", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    std::wstring path = g_hs[i].path;
+    if (path == g_sessPath) EndSession();
+    DeleteFileW(path.c_str());
+    int j = SideIndexOf(path);
+    if (j >= 0) g_hs.erase(g_hs.begin() + j);
+    SideFill(-1);
 }
 
 static void UpdateUi() {
     bool on = g_capturing;
-    SetWindowTextW(hStart, on ? L"Stop" : L"Start");
+    InvalidateRect(hStart, nullptr, TRUE);          // the Record button is owner-drawn (red circle / stop square)
     EnableWindow(hStart, g_ready);
+    SideFill(g_sessPath.empty() ? -1 : SideIndexOf(g_sessPath));
     EnableWindow(hMic, !on && g_micOn);
 }
 
+// Everything in Layout() except the sidebar is placed as before and shifted right by the sidebar width `sb`.
+#define MoveWindow(h_, x_, y_, w_, hh_, r_) (MoveWindow)(h_, (x_) + sb, y_, w_, hh_, r_)
 static void Layout(int w, int h) {
+    int sb = S(250);
+    (MoveWindow)(hSideLbl, S(12), S(12), sb - S(20), S(22), TRUE);
+    (MoveWindow)(hSideList, S(10), S(38), sb - S(20), std::max(S(60), h - S(38) - S(10)), TRUE);
+    w -= sb;
     int m = S(10), rowH = S(26), y = m;
     int lblW = S(130);
     // row 1: microphone
@@ -1043,14 +1047,13 @@ static void Layout(int w, int h) {
     MoveWindow(hTrModel, m + lblW, y, w - 2 * m - lblW, S(300), TRUE);
     y += rowH + m;
     // row 3: buttons + level meters (microphone on top, system audio below)
-    int bw = S(90), bh = rowH + S(2);
-    MoveWindow(hStart, m, y, bw, bh, TRUE);
-    MoveWindow(hClear, m + bw + m, y, bw, bh, TRUE);
-    MoveWindow(hCopy, m + 2 * (bw + m), y, S(150), bh, TRUE);
-    MoveWindow(hCopyTr, m + 2 * (bw + m) + S(150) + m, y, S(160), bh, TRUE);
-    MoveWindow(hSave, m + 2 * (bw + m) + S(150) + S(160) + 2 * m, y, bw + S(10), bh, TRUE);
-    MoveWindow(hHist, m + 2 * (bw + m) + S(150) + S(160) + 3 * m + bw + S(10), y, S(110), bh, TRUE);
-    int lx = m + 2 * (bw + m) + S(150) + S(160) + 4 * m + bw + S(10) + S(110);
+    int bw = S(90), rw = S(140), bh = rowH + S(2);
+    MoveWindow(hStart, m, y, rw, bh, TRUE);
+    MoveWindow(hClear, m + rw + m, y, bw, bh, TRUE);
+    MoveWindow(hCopy, m + rw + bw + 2 * m, y, S(150), bh, TRUE);
+    MoveWindow(hCopyTr, m + rw + bw + S(150) + 3 * m, y, S(160), bh, TRUE);
+    MoveWindow(hSave, m + rw + bw + S(150) + S(160) + 4 * m, y, bw + S(10), bh, TRUE);
+    int lx = m + rw + bw + S(150) + S(160) + 5 * m + bw + S(10);
     MoveWindow(hLevel, lx, y + S(3), std::max(S(40), w - m - lx), S(10), TRUE);
     MoveWindow(hLevel2, lx, y + S(16), std::max(S(40), w - m - lx), S(10), TRUE);
     y += bh + m;
@@ -1079,7 +1082,8 @@ static void Layout(int w, int h) {
     MoveWindow(hSpkLbl, m, y + S(4), lblW, rowH, TRUE);
     MoveWindow(hSpkModel, m + lblW, y, w - 2 * m - lblW, S(300), TRUE);
     y += rowH + m;
-    MoveWindow(hStatus, m, y, w - 2 * m, S(20), TRUE);
+    MoveWindow(hSpin, m, y - S(1), S(22), S(22), TRUE);
+    MoveWindow(hStatus, m + S(28), y, w - 2 * m - S(28), S(20), TRUE);
     MoveWindow(hProg, m, y + S(22), w - 2 * m, S(8), TRUE);   // download progress bar (shown only while downloading)
     y += S(34);
     // two panels share the rest
@@ -1091,6 +1095,8 @@ static void Layout(int w, int h) {
     MoveWindow(hCapTr, m, y, w - 2 * m, capH, TRUE); y += capH;
     MoveWindow(hEditTr, m, y, w - 2 * m, std::max(S(30), h - y - m), TRUE);
 }
+
+#undef MoveWindow
 
 static HWND Mk(const wchar_t* cls, const wchar_t* txt, DWORD style, int id, DWORD ex = 0) {
     HWND c = CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, hMain,
@@ -1232,12 +1238,16 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         hSwap = Mk(L"BUTTON", L"⇄", BS_PUSHBUTTON | WS_TABSTOP, ID_SWAP);
         hTgtLbl = Mk(L"STATIC", L"Translate to:", 0, 0);
         hTgt = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_TGT);
-        hStart = Mk(L"BUTTON", L"Start", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, ID_START);
+        hSpin = Mk(L"STATIC", L"", SS_OWNERDRAW, ID_SPIN);
+        SetTimer(hw, 1, 90, nullptr);                  // spinner animation
+        hSideLbl = Mk(L"STATIC", L"Sessions", 0, 0);
+        SendMessageW(hSideLbl, WM_SETFONT, (WPARAM)hBoldFont, TRUE);
+        hSideList = Mk(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP, ID_SIDELIST, WS_EX_CLIENTEDGE);
+        hStart = Mk(L"BUTTON", L"Record", BS_OWNERDRAW | WS_TABSTOP | WS_DISABLED, ID_START);
         hClear = Mk(L"BUTTON", L"Clear", BS_PUSHBUTTON | WS_TABSTOP, ID_CLEAR);
         hCopy = Mk(L"BUTTON", L"Copy text", BS_PUSHBUTTON | WS_TABSTOP, ID_COPY);
         hCopyTr = Mk(L"BUTTON", L"Copy translation", BS_PUSHBUTTON | WS_TABSTOP, ID_COPYTR);
         hSave = Mk(L"BUTTON", L"Save...", BS_PUSHBUTTON | WS_TABSTOP, ID_SAVE);
-        hHist = Mk(L"BUTTON", L"History...", BS_PUSHBUTTON | WS_TABSTOP, ID_HIST);
         hLevel = Mk(PROGRESS_CLASSW, L"", 0, ID_LEVEL);
         hLevel2 = Mk(PROGRESS_CLASSW, L"", 0, ID_LEVEL2);
         SendMessageW(hLevel, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
@@ -1348,6 +1358,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hSens, TBM_SETPOS, TRUE, geti(L"sens2", 60));
         UpdateFx(false);
         UpdateConv(false);
+        SideRefresh();
         wchar_t savedMic[256];
         GetPrivateProfileStringW(L"app", L"mic", L"", savedMic, 256, g_ini.c_str());
         if (savedMic[0]) {
@@ -1358,23 +1369,118 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         g_boot = std::thread(BootstrapThread);
         return 0;
     }
+    case WM_TIMER:
+        if (wp == 1) {
+            bool busy = g_busy || g_switching;
+            if (busy) {
+                g_spinStep = (g_spinStep + 1) % 12;
+                if (!IsWindowVisible(hSpin)) ShowWindow(hSpin, SW_SHOWNA);
+                InvalidateRect(hSpin, nullptr, FALSE);
+            } else if (IsWindowVisible(hSpin)) ShowWindow(hSpin, SW_HIDE);
+        }
+        return 0;
+    case WM_DRAWITEM: {                  // the round red Record button and the spinner
+        auto* d = (DRAWITEMSTRUCT*)lp;
+        if (d->CtlID == ID_SPIN) {       // 12 dots on a ring, the "head" moves round and the tail fades out
+            HDC dc = d->hDC;
+            RECT r = d->rcItem;
+            FillRect(dc, &r, (HBRUSH)(COLOR_BTNFACE + 1));
+            int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, rad = (std::min(r.right - r.left, r.bottom - r.top) / 2) - S(4);
+            const COLORREF head = RGB(37, 99, 235);
+            COLORREF back = GetSysColor(COLOR_BTNFACE);
+            for (int i = 0; i < 12; i++) {
+                int age = (g_spinStep - i + 12) % 12;                    // 0 = newest dot
+                double k = 1.0 - age / 12.0;                              // 1 .. 0.08
+                double a = i * 3.14159265358979 / 6.0 - 3.14159265358979 / 2;
+                int x = cx + (int)(rad * std::cos(a)), y = cy + (int)(rad * std::sin(a));
+                int dot = std::max(2, (int)(S(3) * (0.55 + 0.45 * k)));
+                auto mix = [&](int h2, int b2) { return (int)(b2 + (h2 - b2) * k); };
+                COLORREF c = RGB(mix(GetRValue(head), GetRValue(back)), mix(GetGValue(head), GetGValue(back)), mix(GetBValue(head), GetBValue(back)));
+                HBRUSH br = CreateSolidBrush(c);
+                HPEN pn = CreatePen(PS_SOLID, 1, c);
+                HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pn);
+                Ellipse(dc, x - dot, y - dot, x + dot, y + dot);
+                SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(br); DeleteObject(pn);
+            }
+            return TRUE;
+        }
+        if (d->CtlID != ID_START) break;
+        HDC dc = d->hDC;
+        RECT r = d->rcItem;
+        bool dis = (d->itemState & ODS_DISABLED) != 0, down = (d->itemState & ODS_SELECTED) != 0, rec = g_capturing;
+        COLORREF bg = rec ? (down ? RGB(150, 20, 20) : RGB(196, 30, 30)) : (down ? RGB(205, 205, 205) : RGB(238, 238, 238));
+        HBRUSH bb = CreateSolidBrush(bg);
+        HPEN pen = CreatePen(PS_SOLID, 1, rec ? RGB(130, 15, 15) : RGB(140, 140, 140));
+        HGDIOBJ op = SelectObject(dc, pen), ob = SelectObject(dc, bb);
+        RoundRect(dc, r.left, r.top, r.right, r.bottom, S(10), S(10));
+        SelectObject(dc, op); SelectObject(dc, ob); DeleteObject(pen); DeleteObject(bb);
+        int hgt = r.bottom - r.top, dia = hgt * 5 / 10, cx = r.left + S(14), cy = r.top + (hgt - dia) / 2;
+        if (rec) {                                                       // recording: white stop square
+            HBRUSH wb = CreateSolidBrush(RGB(255, 255, 255));
+            RECT sq{cx, cy, cx + dia, cy + dia};
+            FillRect(dc, &sq, wb);
+            DeleteObject(wb);
+        } else {                                                         // idle: red circle
+            HBRUSH cb = CreateSolidBrush(dis ? RGB(190, 190, 190) : RGB(222, 28, 28));
+            HPEN np = CreatePen(PS_SOLID, 1, dis ? RGB(170, 170, 170) : RGB(160, 15, 15));
+            HGDIOBJ op2 = SelectObject(dc, np), ob2 = SelectObject(dc, cb);
+            Ellipse(dc, cx, cy, cx + dia, cy + dia);
+            SelectObject(dc, op2); SelectObject(dc, ob2); DeleteObject(np); DeleteObject(cb);
+        }
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, rec ? RGB(255, 255, 255) : (dis ? RGB(150, 150, 150) : RGB(30, 30, 30)));
+        HGDIOBJ of = SelectObject(dc, hBigFont);
+        RECT tr{cx + dia + S(8), r.top, r.right - S(8), r.bottom};
+        DrawTextW(dc, rec ? L"Stop" : L"Record", -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        SelectObject(dc, of);
+        if (d->itemState & ODS_FOCUS) { RECT fr = r; InflateRect(&fr, -S(3), -S(3)); DrawFocusRect(dc, &fr); }
+        return TRUE;
+    }
+    case WM_VKEYTOITEM:                  // Delete key in the sessions list
+        if ((HWND)lp == hSideList && LOWORD(wp) == VK_DELETE) { DeleteSessionAt(hw, (int)SendMessageW(hSideList, LB_GETCURSEL, 0, 0)); return -2; }
+        return -1;
+    case WM_CONTEXTMENU:
+        if ((HWND)wp == hSideList && !g_capturing) {
+            POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)}, cp = pt;
+            ScreenToClient(hSideList, &cp);
+            LRESULT hit = SendMessageW(hSideList, LB_ITEMFROMPOINT, 0, MAKELPARAM(cp.x, cp.y));
+            int idx = HIWORD(hit) == 0 ? (int)LOWORD(hit) : -1;
+            if (idx >= 0) { g_sideBusy = true; SendMessageW(hSideList, LB_SETCURSEL, idx, 0); g_sideBusy = false; }
+            HMENU mn = CreatePopupMenu();
+            AppendMenuW(mn, MF_STRING | (idx < 0 ? MF_GRAYED : 0), 1, L"Open");
+            AppendMenuW(mn, MF_STRING | (idx < 0 ? MF_GRAYED : 0), 2, L"Delete");
+            AppendMenuW(mn, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(mn, MF_STRING, 3, L"Open the history folder");
+            int cmd = TrackPopupMenu(mn, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hw, nullptr);
+            DestroyMenu(mn);
+            if (cmd == 1) OpenSession(idx);
+            else if (cmd == 2) DeleteSessionAt(hw, idx);
+            else if (cmd == 3) OpenFolder(L"history");
+            return 0;
+        }
+        break;
     case WM_HSCROLL:
         if ((HWND)lp == hGain || (HWND)lp == hNsStr) UpdateFx(LOWORD(wp) == TB_ENDTRACK);   // save when the drag ends
         if ((HWND)lp == hSens) UpdateConv(LOWORD(wp) == TB_ENDTRACK);
         return 0;
     case WM_SIZE: Layout(LOWORD(lp), HIWORD(lp)); return 0;
-    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(860), S(820)}; return 0; }
+    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(860) + S(250), S(820)}; return 0; }
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_START:
             if (g_capturing) {
                 StopCapture();
-                SetStatus(L"Stopped.");
+                SetStatus(L"Record saved to the sessions list.");
             } else {
                 int sel = (int)SendMessageW(hMic, CB_GETCURSEL, 0, 0);
                 UINT dev = (UINT)SendMessageW(hMic, CB_GETITEMDATA, sel, 0);
-                if (StartCapture(dev)) SetStatus(g_sysOn ? L"Listening to you and to the other side..." : L"Listening... speak now.");
-                else SetStatus(g_micOn ? L"Could not open the microphone." : L"Nothing to capture: enable the microphone or the system audio.");
+                if (StartCapture(dev)) {
+                    PaneClear(g_src); PaneClear(g_tr);                    // a new record starts with empty panels
+                    g_utts.clear(); g_await[0].clear(); g_await[1].clear();
+                    SendFrame('R', nullptr, 0);                          // and with no remembered voices
+                    BeginSession();                                      // its date and time appear in the sidebar
+                    SetStatus(g_sysOn ? L"Recording: listening to you and to the other side..." : L"Recording... speak now.");
+                } else SetStatus(g_micOn ? L"Could not open the microphone." : L"Nothing to capture: enable the microphone or the system audio.");
             }
             UpdateUi();
             return 0;
@@ -1385,7 +1491,9 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             SendFrame('R', nullptr, 0);      // new conversation: forget the known voices
             return 0;
         case ID_SAVE: SaveDocuments(hw); return 0;
-        case ID_HIST: OpenHistory(); return 0;
+        case ID_SIDELIST:
+            if (HIWORD(wp) == LBN_SELCHANGE && !g_sideBusy) OpenSession((int)SendMessageW(hSideList, LB_GETCURSEL, 0, 0));
+            return 0;
 
         case ID_NS: case ID_AGC: case ID_BOOST: UpdateFx(true); return 0;
         case ID_REV: case ID_ECHO: case ID_ONE: case ID_MANY: UpdateConv(true); return 0;
@@ -1409,6 +1517,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                     SaveSettings();
                     std::string id(g_trmWanted.begin(), g_trmWanted.end());
                     SendFrame('G', id.data(), (uint32_t)id.size());
+                    g_switching = true;
                     SetStatus(L"Switching the translation model...");
                 }
             }
@@ -1421,6 +1530,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                     SaveSettings();
                     std::string id(g_spkWanted.begin(), g_spkWanted.end());
                     SendFrame('M', id.data(), (uint32_t)id.size());
+                    g_switching = true;
                     SetStatus(L"Switching the speaker model...");
                 }
             }
@@ -1491,10 +1601,11 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         case 'S':
             if (m->text.rfind(L"ready", 0) == 0) {
                 g_ready = true;
+                g_busy = false;
                 ShowWindow(hProg, SW_HIDE);
                 SendLanguage();
                 SetStatus(L"Ready " + m->text.substr(6) + (g_trAvailable ? L", NLLB translation enabled." : L", translation unavailable.") +
-                          L" Choose a microphone and press Start.");
+                          L" Choose a microphone and press Record.");
                 UpdateUi();
             } else SetStatus(m->text);
             break;
@@ -1520,6 +1631,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case 'Z':  // the translation model that is now active
             g_trmActive = m->text;
+            g_switching = false;
             for (auto& tm : g_trm) if (tm.id == m->text) tm.present = true;
             if (g_trmWanted.empty()) g_trmWanted = m->text;
             RefreshTrmCombo();
@@ -1541,10 +1653,15 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case 'M':  // the speaker model that is now active
             g_spkActive = m->text;
+            g_switching = false;
             for (auto& sm : g_spk) if (sm.id == m->text) sm.present = true;
             if (g_spkWanted.empty()) g_spkWanted = m->text;
             RefreshSpkCombo();
             if (!m->text.empty()) { ShowWindow(hProg, SW_HIDE); }
+            break;
+        case 'E':  // start-up failed: stop the spinner, show why
+            g_busy = false;
+            SetStatus(m->text);
             break;
         case 'D':  // download / install progress (percent < 0 hides the bar)
             if (m->spk < 0) { ShowWindow(hProg, SW_HIDE); break; }
@@ -1592,6 +1709,8 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case 'X':
             g_ready = false;
+            g_busy = false;
+            g_switching = false;
             if (g_capturing) StopCapture();
             SetStatus(L"The recognizer stopped (see worker.log next to the program).");
             UpdateUi();
@@ -1610,7 +1729,32 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hw, msg, wp, lp);
 }
 
+// A crash leaves its reason in crash.log next to the program (exception code / address, or the C++ exception text).
+static void CrashLog(const std::string& what) {
+    HANDLE f = CreateFileW((ExeDir() + L"\\crash.log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    std::wstring st = Stamp();
+    std::string line = std::string(st.begin(), st.end()) + "  " + what + "\r\n";
+    DWORD w;
+    WriteFile(f, line.data(), (DWORD)line.size(), &w, nullptr);
+    CloseHandle(f);
+}
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    char b[160];
+    snprintf(b, sizeof b, "unhandled exception 0x%08lX at %p", ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    CrashLog(b);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static void OnTerminate() {
+    std::string what = "std::terminate";
+    try { throw; } catch (const std::exception& e) { what += std::string(": ") + e.what(); } catch (...) {}
+    CrashLog(what);
+    abort();
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
+    SetUnhandledExceptionFilter(CrashFilter);
+    std::set_terminate(OnTerminate);
     SetProcessDPIAware();
     INITCOMMONCONTROLSEX ic{sizeof ic, ICC_PROGRESS_CLASS | ICC_BAR_CLASSES};
     InitCommonControlsEx(&ic);
@@ -1621,17 +1765,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"VoiceWindow";
     RegisterClassW(&wc);
-    WNDCLASSW hc{};
-    hc.lpfnWndProc = HistProc;
-    hc.hInstance = hInst;
-    hc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    hc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    hc.lpszClassName = L"VoiceHistory";
-    RegisterClassW(&hc);
     HDC dc = GetDC(nullptr); int dpi = GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(nullptr, dc);
     // WS_EX_TOPMOST: always above other windows; it leaves only when minimized with the "-" button
     HWND w = CreateWindowExW(WS_EX_TOPMOST, L"VoiceWindow", L"Voice Recognition and Translation", WS_OVERLAPPEDWINDOW,
-                             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(1080, dpi, 96),
+                             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(1160, dpi, 96), MulDiv(1080, dpi, 96),
                              nullptr, nullptr, hInst, nullptr);
     ShowWindow(w, show);
     MSG m;
