@@ -139,7 +139,10 @@ final class MainController: NSObject, NSTableViewDataSource, NSTableViewDelegate
 
     func buildUI() {
         window.title = "Voice Recognition and Translation"
-        window.minSize = NSSize(width: 980, height: 640)
+        window.minSize = NSSize(width: 1100, height: 640)
+        if let vis = NSScreen.main?.visibleFrame {      // never taller / wider than the screen
+            window.setContentSize(NSSize(width: min(1180, vis.width - 40), height: min(780, vis.height - 60)))
+        }
         window.delegate = self
         window.center()
 
@@ -180,11 +183,22 @@ final class MainController: NSObject, NSTableViewDataSource, NSTableViewDelegate
         nsSld.widthAnchor.constraint(equalToConstant: 120).isActive = true
         sensSld.widthAnchor.constraint(equalToConstant: 120).isActive = true
 
-        let r1 = row([lbl("Microphone:"), micPop, micOn, sysOn, revChk, echoChk])
-        let r2 = row([lbl("Language:"), langPop, swapBtn, lbl("Translate to:"), tgtPop, lbl("Translation model:"), trmPop, clearBtn])
-        let r3 = row([lbl("Gain:"), gainSld, gainLbl, agcChk, boostChk, nsChk, nsSld, nsLbl])
-        let r4 = row([oneRadio, manyRadio, lbl("Speaker model:"), spkPop, lbl("Sensitivity:"), sensSld, sensLbl, topChk, saveBtn])
-        for r in [r1, r2, r3, r4] { r.setHuggingPriority(.required, for: .vertical) }
+        // fixed widths: nothing may push the window wider than the screen
+        micPop.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        langPop.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        tgtPop.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        trmPop.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        spkPop.widthAnchor.constraint(equalToConstant: 230).isActive = true
+        gainLbl.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        nsLbl.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        sensLbl.widthAnchor.constraint(equalToConstant: 40).isActive = true
+
+        let r1 = row([lbl("Microphone:"), micPop, micOn, sysOn, echoChk])
+        let r2 = row([lbl("Language:"), langPop, swapBtn, lbl("Translate to:"), tgtPop, revChk])
+        let r3 = row([lbl("Translation model:"), trmPop, clearBtn, saveBtn, topChk])
+        let r4 = row([lbl("Gain:"), gainSld, gainLbl, agcChk, boostChk, nsChk, nsSld, nsLbl])
+        let r5 = row([oneRadio, manyRadio, lbl("Speaker model:"), spkPop, lbl("Sensitivity:"), sensSld, sensLbl])
+        for r in [r1, r2, r3, r4, r5] { r.setHuggingPriority(.required, for: .vertical) }
 
         gated = [micPop, micOn, sysOn, revChk, echoChk, langPop, tgtPop, swapBtn, trmPop, clearBtn, gainSld, agcChk, boostChk, nsChk,
                  nsSld, oneRadio, manyRadio, spkPop, sensSld, saveBtn]
@@ -213,7 +227,8 @@ final class MainController: NSObject, NSTableViewDataSource, NSTableViewDelegate
         statusLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let bottom = row([recordBtn, lbl("You"), levelMic, lbl("Them"), levelSys, spinner, progress, statusLbl])
 
-        let main = NSStackView(views: [r1, r2, r3, r4, panes, bottom])
+        for box in panes.arrangedSubviews { box.widthAnchor.constraint(equalTo: panes.widthAnchor).isActive = true }
+        let main = NSStackView(views: [r1, r2, r3, r4, r5, panes, bottom])
         main.orientation = .vertical
         main.alignment = .leading
         main.spacing = 10

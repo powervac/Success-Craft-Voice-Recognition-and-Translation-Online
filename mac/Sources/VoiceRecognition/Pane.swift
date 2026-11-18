@@ -35,7 +35,12 @@ final class Pane {
         let p1: [(CGFloat, CGFloat, CGFloat)] = [(20, 130, 50), (205, 100, 10), (190, 40, 50), (120, 120, 0), (130, 80, 40), (190, 40, 160)]
         let i = (max(spk, 1) - 1) % 6
         let c = ch == 0 ? p0[i] : p1[i]
-        return NSColor(srgbRed: c.0 / 255, green: c.1 / 255, blue: c.2 / 255, alpha: 1)
+        let (r, g, b) = (c.0 / 255, c.1 / 255, c.2 / 255)
+        return NSColor(name: nil) { appearance in   // lighter in dark mode, so it stays readable on a dark background
+            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let f: CGFloat = dark ? 0.55 : 0
+            return NSColor(srgbRed: r + (1 - r) * f, green: g + (1 - g) * f, blue: b + (1 - b) * f, alpha: 1)
+        }
     }
 
     private func attributed(_ e: Entry, faded: Bool) -> NSAttributedString {
