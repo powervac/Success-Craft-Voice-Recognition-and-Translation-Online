@@ -1,0 +1,10 @@
+
+
+1 24 "installer.manifest"
+
+F_EXE     RCDATA "../VoiceWindow.exe"
+F_WORKER  RCDATA "../worker.py"
+F_DLPROG  RCDATA "../dl_progress.py"
+F_REQ     RCDATA "../requirements.txt"
+F_MODELS  RCDATA "install_models.py"
+F_README  RCDATA "../README.md"

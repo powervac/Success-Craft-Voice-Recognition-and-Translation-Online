@@ -8,3 +8,5 @@ venv/
 data/
 __pycache__/
 *.pyc
+# downloaded C++ toolchain (install_and_build.bat)
+tools/
