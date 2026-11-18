@@ -8,3 +8,33 @@ F_DLPROG  RCDATA "../dl_progress.py"
 F_REQ     RCDATA "../requirements.txt"
 F_MODELS  RCDATA "install_models.py"
 F_README  RCDATA "../README.md"
+
+1 VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Success Craft"
+            VALUE "FileDescription", "Voice Recognition and Translation - setup"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "VoiceRecognitionSetup"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Success Craft. MIT License."
+            VALUE "OriginalFilename", "VoiceRecognitionSetup.exe"
+            VALUE "ProductName", "Voice Recognition and Translation"
+            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "Comments", "Open source: https://github.com/powervac/Success-Craft-Voice-Recognition-and-Translation-Online"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

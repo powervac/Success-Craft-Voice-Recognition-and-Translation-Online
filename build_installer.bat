@@ -10,7 +10,7 @@ if not exist VoiceWindow.exe call build.bat
 if not exist VoiceWindow.exe goto :fail
 cd installer
 windres installer.rc -O coff -o installer_res.o || goto :fail
-g++ -std=c++17 -O2 -municode -static installer.cpp installer_res.o -o ..\VoiceRecognitionSetup.exe -lole32 -luuid -lshell32 -lurlmon || goto :fail
+g++ -std=c++17 -O2 -s -municode -static installer.cpp installer_res.o -o ..\VoiceRecognitionSetup.exe -lole32 -luuid -lshell32 -lurlmon || goto :fail
 del installer_res.o
 cd ..
 echo.
