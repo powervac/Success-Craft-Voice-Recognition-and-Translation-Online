@@ -37,7 +37,7 @@
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
        ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
-       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL, ID_TRMODEL, ID_SIDELIST, ID_SPIN, ID_NEWSESS };
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL, ID_TRMODEL, ID_SIDELIST, ID_SPIN, ID_NEWSESS, ID_HINT };
 enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
@@ -51,6 +51,8 @@ static std::atomic<int> g_gainDb{0}, g_ns{1}, g_nsStr{50}, g_agc{1}, g_boost{0};
 static std::atomic<int> g_sysOn{0}, g_rev{1}, g_echo{0}, g_diar{0}, g_sens{60}, g_micOn{1};
 static void EndSession();
 static void UpdateUi();
+static HWND hHint;                                    // yellow callout pointing at "+ New session"
+static int g_pulse = 0, g_hintX = 0, g_hintY = 0;      // attention animation
 static HWND hSpin;                                    // round spinner: the program is busy loading, it has not hung
 static int g_spinStep = 0;
 static bool g_busy = true;                           // true from the start until the recognizer is ready (or has failed)
@@ -1013,11 +1015,30 @@ static void DeleteSessionAt(HWND owner, int i) {
     SideFill(-1);
 }
 
+// Without an open session everything right of the list is greyed out; only "+ New session" is bright.
+static void SetMainEnabled(bool on) {
+    HWND all[] = {hMicLbl, hMic, hMicOn, hSysLbl, hSysDev, hLangLbl, hLang, hSwap, hTgtLbl, hTgt, hTrmLbl, hTrModel, hClear,
+                  hGainLbl, hGain, hGainVal, hAgc, hNs, hNsStr, hNsVal, hBoost, hSysOn, hRev, hEcho, hOne, hMany, hSens, hSensVal,
+                  hSpkLbl, hSpkModel};
+    for (HWND c : all) EnableWindow(c, on);
+    if (!on) return;
+    EnableWindow(hTgt, g_trAvailable);                 // restore the individual states
+    EnableWindow(hSwap, g_trAvailable);
+    EnableWindow(hMany, g_spkAvailable);
+    UpdateFx(false);
+    UpdateConv(false);
+    EnableWindow(hMic, !g_capturing && g_micOn);
+}
+
 static void UpdateUi() {
     bool on = g_capturing;
     InvalidateRect(hStart, nullptr, TRUE);          // the Record button is owner-drawn (red circle / stop square)
-    EnableWindow(hStart, g_ready && (g_active || g_capturing));
+    bool sessionOn = g_active || g_capturing;
+    SetMainEnabled(sessionOn);
+    EnableWindow(hStart, g_ready && sessionOn);
     EnableWindow(hNew, !g_capturing);
+    ShowWindow(hHint, sessionOn ? SW_HIDE : SW_SHOWNA);   // the callout is shown until a session is open
+    InvalidateRect(hNew, nullptr, TRUE);
     SideFill(g_sessPath.empty() ? -1 : SideIndexOf(g_sessPath));
     EnableWindow(hMic, !on && g_micOn);
 }
@@ -1028,6 +1049,8 @@ static void Layout(int w, int h) {
     int sb = S(250);
     (MoveWindow)(hSideLbl, S(12), S(12), sb - S(20), S(22), TRUE);
     (MoveWindow)(hNew, S(10), S(38), sb - S(20), S(32), TRUE);
+    g_hintX = sb - S(4); g_hintY = S(34);
+    SetWindowPos(hHint, nullptr, g_hintX, g_hintY, S(330), S(40), SWP_NOZORDER | SWP_NOACTIVATE);
     (MoveWindow)(hSideList, S(10), S(78), sb - S(20), std::max(S(60), h - S(78) - S(10)), TRUE);
     w -= sb;
     int m = S(10), rowH = S(26), y = m;
@@ -1248,7 +1271,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         SetTimer(hw, 1, 90, nullptr);                  // spinner animation
         hSideLbl = Mk(L"STATIC", L"Sessions", 0, 0);
         SendMessageW(hSideLbl, WM_SETFONT, (WPARAM)hBoldFont, TRUE);
-        hNew = Mk(L"BUTTON", L"+ New session", BS_PUSHBUTTON | WS_TABSTOP, ID_NEWSESS);
+        hNew = Mk(L"BUTTON", L"+ New session", BS_OWNERDRAW | WS_TABSTOP, ID_NEWSESS);
         hSideList = Mk(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP, ID_SIDELIST, WS_EX_CLIENTEDGE);
         hStart = Mk(L"BUTTON", L"Record", BS_OWNERDRAW | WS_TABSTOP | WS_DISABLED, ID_START);
         hClear = Mk(L"BUTTON", L"Clear", BS_PUSHBUTTON | WS_TABSTOP, ID_CLEAR);
@@ -1366,6 +1389,9 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateFx(false);
         UpdateConv(false);
         SideRefresh();
+        hHint = Mk(L"STATIC", L"", SS_OWNERDRAW, ID_HINT);
+        SetWindowPos(hHint, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        UpdateUi();
         wchar_t savedMic[256];
         GetPrivateProfileStringW(L"app", L"mic", L"", savedMic, 256, g_ini.c_str());
         if (savedMic[0]) {
@@ -1378,6 +1404,13 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_TIMER:
         if (wp == 1) {
+            if (!g_active && !g_capturing) {                 // pulse the button, let the callout bob
+                g_pulse++;
+                InvalidateRect(hNew, nullptr, FALSE);
+                InvalidateRect(hHint, nullptr, FALSE);
+                int bob = (int)(S(4) * (0.5 + 0.5 * std::sin(g_pulse * 0.30)));
+                SetWindowPos(hHint, nullptr, g_hintX + bob, g_hintY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
             bool busy = g_busy || g_switching;
             if (busy) {
                 g_spinStep = (g_spinStep + 1) % 12;
@@ -1388,6 +1421,49 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DRAWITEM: {                  // the round red Record button and the spinner
         auto* d = (DRAWITEMSTRUCT*)lp;
+        if (d->CtlID == ID_NEWSESS) {    // bright and pulsing while a session is needed
+            HDC dc = d->hDC;
+            RECT r = d->rcItem;
+            bool attn = !g_active && !g_capturing, dis = (d->itemState & ODS_DISABLED) != 0, down = (d->itemState & ODS_SELECTED) != 0;
+            double k = 0.5 + 0.5 * std::sin(g_pulse * 0.30);
+            COLORREF bg = dis ? RGB(228, 228, 228) : attn ? RGB((int)(255), (int)(140 + 70 * k), (int)(10 + 60 * k)) : (down ? RGB(205, 205, 205) : RGB(238, 238, 238));
+            COLORREF edge = dis ? RGB(190, 190, 190) : attn ? RGB(200, 90, 0) : RGB(140, 140, 140);
+            HBRUSH bb = CreateSolidBrush(bg);
+            HPEN pen = CreatePen(PS_SOLID, attn ? 2 : 1, edge);
+            HGDIOBJ op = SelectObject(dc, pen), ob = SelectObject(dc, bb);
+            RoundRect(dc, r.left + 1, r.top + 1, r.right - 1, r.bottom - 1, S(10), S(10));
+            SelectObject(dc, op); SelectObject(dc, ob); DeleteObject(pen); DeleteObject(bb);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, dis ? RGB(150, 150, 150) : attn ? RGB(255, 255, 255) : RGB(30, 30, 30));
+            HGDIOBJ of = SelectObject(dc, hBoldFont);
+            DrawTextW(dc, L"+ New session", -1, &r, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+            SelectObject(dc, of);
+            return TRUE;
+        }
+        if (d->CtlID == ID_HINT) {       // yellow callout with an arrow to the left, towards the button
+            HDC dc = d->hDC;
+            RECT r = d->rcItem;
+            HBRUSH back = (HBRUSH)(COLOR_BTNFACE + 1);
+            FillRect(dc, &r, back);
+            int ar = S(12);
+            HBRUSH yb = CreateSolidBrush(RGB(255, 233, 130));
+            HPEN yp = CreatePen(PS_SOLID, 2, RGB(214, 150, 0));
+            HGDIOBJ op = SelectObject(dc, yp), ob = SelectObject(dc, yb);
+            RoundRect(dc, r.left + ar, r.top + 1, r.right - 1, r.bottom - 1, S(10), S(10));
+            POINT tri[3] = {{r.left + 1, (r.top + r.bottom) / 2}, {r.left + ar + 2, (r.top + r.bottom) / 2 - S(9)}, {r.left + ar + 2, (r.top + r.bottom) / 2 + S(9)}};
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            Polygon(dc, tri, 3);
+            SelectObject(dc, yp);
+            MoveToEx(dc, tri[1].x, tri[1].y, nullptr); LineTo(dc, tri[0].x, tri[0].y); LineTo(dc, tri[2].x, tri[2].y);
+            SelectObject(dc, op); SelectObject(dc, ob); DeleteObject(yp); DeleteObject(yb);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(60, 40, 0));
+            HGDIOBJ of = SelectObject(dc, hBoldFont);
+            RECT tr{r.left + ar + S(10), r.top, r.right - S(8), r.bottom};
+            DrawTextW(dc, L"Start here: press \"+ New session\"", -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+            SelectObject(dc, of);
+            return TRUE;
+        }
         if (d->CtlID == ID_SPIN) {       // 12 dots on a ring, the "head" moves round and the tail fades out
             HDC dc = d->hDC;
             RECT r = d->rcItem;
