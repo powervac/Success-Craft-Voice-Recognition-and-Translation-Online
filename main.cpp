@@ -37,7 +37,7 @@
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
        ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
-       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL, ID_TRMODEL, ID_SIDELIST, ID_SPIN };
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL, ID_TRMODEL, ID_SIDELIST, ID_SPIN, ID_NEWSESS };
 enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
@@ -50,6 +50,7 @@ static const int NLANGS = sizeof(LANGS) / sizeof(LANGS[0]);
 static std::atomic<int> g_gainDb{0}, g_ns{1}, g_nsStr{50}, g_agc{1}, g_boost{0};
 static std::atomic<int> g_sysOn{0}, g_rev{1}, g_echo{0}, g_diar{0}, g_sens{60}, g_micOn{1};
 static void EndSession();
+static void UpdateUi();
 static HWND hSpin;                                    // round spinner: the program is busy loading, it has not hung
 static int g_spinStep = 0;
 static bool g_busy = true;                           // true from the start until the recognizer is ready (or has failed)
@@ -751,7 +752,6 @@ static void StopLoopback() {
 
 static bool StartCapture(UINT dev) {
     if (!g_micOn && !g_sysOn) return false;          // nothing to listen to
-    EndSession();                                    // a new history session starts with the first utterance
     g_ch[0] = Channel(0);
     if (g_micOn) {                                   // with the microphone switched off it is not even opened
         WAVEFORMATEX wf{WAVE_FORMAT_PCM, 1, 16000, 32000, 2, 16, 0};
@@ -836,8 +836,7 @@ static std::string CleanU8(const std::wstring& w) {
 static void BeginSession();
 static void SessionCounted();
 static void SessionAppend(const Utt& u) {
-    if (g_sess == INVALID_HANDLE_VALUE) BeginSession();
-    if (g_sess == INVALID_HANDLE_VALUE) return;
+    if (g_sess == INVALID_HANDLE_VALUE) return;           // no open session: nothing is saved
     std::string line = "U\t" + std::to_string(u.ch) + "\t" + std::to_string(u.spk) + "\t" + (u.labeled ? "1" : "0") + "\t" +
                        u.oLang + "\t" + u.tLang + "\t" + CleanU8(u.orig) + "\t" + CleanU8(u.tr) + "\n";
     DWORD w;
@@ -918,7 +917,8 @@ static void LoadSession(const std::wstring& path) {
 }
 
 // ---- the sessions sidebar: every record (session) with its date and time ----
-static HWND hSideLbl, hSideList;
+static HWND hSideLbl, hSideList, hNew;
+static bool g_active = false;                   // a session was opened with the button: Record writes into it
 static bool g_sideBusy = false;                 // ignore selection events caused by our own list updates
 
 static std::wstring SessionTitle(const HistSession& h) {
@@ -995,14 +995,18 @@ static void OpenFolder(const std::wstring& name) {
 static void OpenSession(int i) {                // show a saved record in the two panels
     if (i < 0 || i >= (int)g_hs.size() || g_capturing) return;
     std::wstring path = g_hs[i].path;
-    LoadSession(path);
+    if (g_active && path == g_sessPath) return;        // that is the open session already
+    LoadSession(path);                                  // (closes the open session)
+    g_active = false;
     SideFill(SideIndexOf(path));
+    UpdateUi();
+    SetStatus(L"Viewing a saved session. Press \"+ New session\" to record again.");
 }
 static void DeleteSessionAt(HWND owner, int i) {
     if (i < 0 || i >= (int)g_hs.size()) return;
     if (MessageBoxW(owner, L"Delete this record from the history?", L"Sessions", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     std::wstring path = g_hs[i].path;
-    if (path == g_sessPath) EndSession();
+    if (path == g_sessPath) { EndSession(); g_active = false; UpdateUi(); }
     DeleteFileW(path.c_str());
     int j = SideIndexOf(path);
     if (j >= 0) g_hs.erase(g_hs.begin() + j);
@@ -1012,7 +1016,8 @@ static void DeleteSessionAt(HWND owner, int i) {
 static void UpdateUi() {
     bool on = g_capturing;
     InvalidateRect(hStart, nullptr, TRUE);          // the Record button is owner-drawn (red circle / stop square)
-    EnableWindow(hStart, g_ready);
+    EnableWindow(hStart, g_ready && (g_active || g_capturing));
+    EnableWindow(hNew, !g_capturing);
     SideFill(g_sessPath.empty() ? -1 : SideIndexOf(g_sessPath));
     EnableWindow(hMic, !on && g_micOn);
 }
@@ -1022,7 +1027,8 @@ static void UpdateUi() {
 static void Layout(int w, int h) {
     int sb = S(250);
     (MoveWindow)(hSideLbl, S(12), S(12), sb - S(20), S(22), TRUE);
-    (MoveWindow)(hSideList, S(10), S(38), sb - S(20), std::max(S(60), h - S(38) - S(10)), TRUE);
+    (MoveWindow)(hNew, S(10), S(38), sb - S(20), S(32), TRUE);
+    (MoveWindow)(hSideList, S(10), S(78), sb - S(20), std::max(S(60), h - S(78) - S(10)), TRUE);
     w -= sb;
     int m = S(10), rowH = S(26), y = m;
     int lblW = S(130);
@@ -1242,6 +1248,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         SetTimer(hw, 1, 90, nullptr);                  // spinner animation
         hSideLbl = Mk(L"STATIC", L"Sessions", 0, 0);
         SendMessageW(hSideLbl, WM_SETFONT, (WPARAM)hBoldFont, TRUE);
+        hNew = Mk(L"BUTTON", L"+ New session", BS_PUSHBUTTON | WS_TABSTOP, ID_NEWSESS);
         hSideList = Mk(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP, ID_SIDELIST, WS_EX_CLIENTEDGE);
         hStart = Mk(L"BUTTON", L"Record", BS_OWNERDRAW | WS_TABSTOP | WS_DISABLED, ID_START);
         hClear = Mk(L"BUTTON", L"Clear", BS_PUSHBUTTON | WS_TABSTOP, ID_CLEAR);
@@ -1470,25 +1477,30 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_START:
             if (g_capturing) {
                 StopCapture();
-                SetStatus(L"Record saved to the sessions list.");
+                SetStatus(L"Paused. Press Record to continue this session, or start a new one.");
             } else {
                 int sel = (int)SendMessageW(hMic, CB_GETCURSEL, 0, 0);
                 UINT dev = (UINT)SendMessageW(hMic, CB_GETITEMDATA, sel, 0);
-                if (StartCapture(dev)) {
-                    PaneClear(g_src); PaneClear(g_tr);                    // a new record starts with empty panels
-                    g_utts.clear(); g_await[0].clear(); g_await[1].clear();
-                    SendFrame('R', nullptr, 0);                          // and with no remembered voices
-                    BeginSession();                                      // its date and time appear in the sidebar
+                if (!g_active) SetStatus(L"Press \"+ New session\" first, then Record.");
+                else if (StartCapture(dev)) {
                     SetStatus(g_sysOn ? L"Recording: listening to you and to the other side..." : L"Recording... speak now.");
                 } else SetStatus(g_micOn ? L"Could not open the microphone." : L"Nothing to capture: enable the microphone or the system audio.");
             }
             UpdateUi();
             return 0;
-        case ID_CLEAR:
+        case ID_NEWSESS:                     // the only way to open a session
+            if (g_capturing) return 0;
             PaneClear(g_src); PaneClear(g_tr);
             g_utts.clear(); g_await[0].clear(); g_await[1].clear();
-            EndSession();                    // the next speech is a new history session
-            SendFrame('R', nullptr, 0);      // new conversation: forget the known voices
+            SendFrame('R', nullptr, 0);      // a new conversation: forget the known voices
+            BeginSession();                  // its date and time appear in the list
+            g_active = g_sess != INVALID_HANDLE_VALUE;
+            UpdateUi();
+            SetStatus(g_active ? L"New session opened. Press Record to start." : L"Could not create the session file (is the program folder writable?).");
+            return 0;
+        case ID_CLEAR:                       // only clears the panels; the session keeps everything it saved
+            PaneClear(g_src); PaneClear(g_tr);
+            g_utts.clear(); g_await[0].clear(); g_await[1].clear();
             return 0;
         case ID_SAVE: SaveDocuments(hw); return 0;
         case ID_SIDELIST:
@@ -1605,7 +1617,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                 ShowWindow(hProg, SW_HIDE);
                 SendLanguage();
                 SetStatus(L"Ready " + m->text.substr(6) + (g_trAvailable ? L", NLLB translation enabled." : L", translation unavailable.") +
-                          L" Choose a microphone and press Record.");
+                          L" Press \"+ New session\", then Record.");
                 UpdateUi();
             } else SetStatus(m->text);
             break;
