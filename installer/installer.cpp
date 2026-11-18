@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+static const wchar_t* PY_ZIP_URL = L"https://www.nuget.org/api/v2/package/python/3.12.10";
 static const wchar_t* PY_URL = L"https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe";
 
 // ---------------------------------------------------------------- console output
@@ -211,22 +212,78 @@ static void MakeShortcut(const std::wstring& target, const std::wstring& workDir
 }
 
 // ---------------------------------------------------------------- Python
+// A usable Python: 3.10 - 3.13 (wheels exist for these) with the modules the setup relies on.
 static bool PythonWorks(const std::wstring& exe) {
-    return RunQuiet(Q(exe) + L" -c \"import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)\"") == 0;
+    return RunQuiet(Q(exe) + L" -c \"import sys, ssl, venv, ensurepip, sqlite3; sys.exit(0 if (3, 10) <= sys.version_info[:2] <= (3, 13) else 1)\"") == 0;
 }
 
 static std::wstring FindPython(const std::wstring& dir) {
     std::vector<std::wstring> c;
-    c.push_back(dir + L"\\python\\python.exe");     // installed by us earlier
+    c.push_back(dir + L"\\python-pkg\\tools\\python.exe");   // our private copy from an earlier run
+    c.push_back(dir + L"\\python\\python.exe");              // older installer versions
     std::wstring la = Env(L"LOCALAPPDATA"), pf = Env(L"ProgramFiles");
     for (const wchar_t* v : {L"313", L"312", L"311", L"310"}) {
         if (!la.empty()) c.push_back(la + L"\\Programs\\Python\\Python" + v + L"\\python.exe");
         if (!pf.empty()) c.push_back(pf + L"\\Python" + v + L"\\python.exe");
     }
+    // registered installations (any location), per user and per machine
+    for (HKEY root : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE})
+        for (const wchar_t* v : {L"3.13", L"3.12", L"3.11", L"3.10"}) {
+            std::wstring key = std::wstring(L"Software\\Python\\PythonCore\\") + v + L"\\InstallPath";
+            wchar_t buf[MAX_PATH * 2] = {};
+            DWORD n = sizeof buf - 2;
+            if (RegGetValueW(root, key.c_str(), L"ExecutablePath", RRF_RT_REG_SZ, nullptr, buf, &n) == ERROR_SUCCESS && buf[0])
+                c.push_back(buf);
+        }
     for (auto& e : c)
         if (Exists(e) && PythonWorks(e)) return e;
     if (PythonWorks(L"python")) return L"python";   // from PATH (the Microsoft Store stub fails this check)
     return L"";
+}
+
+// Python is not "installed" with the python.org setup (it conflicts with existing registrations of the same
+// version and silently does nothing). Instead the official CPython build is unpacked from its NuGet package:
+// a plain zip with the complete interpreter (venv, pip, ssl, sqlite). No registry, no admin rights, no conflicts.
+static std::wstring InstallPrivatePython(const std::wstring& dir) {
+    std::wstring stage = dir + L"\\python-pkg";
+    std::wstring py = stage + L"\\tools\\python.exe";
+    std::wstring zip = Env(L"TEMP") + L"\\voicerecogn-python.zip";
+    std::wstring tar = Env(L"SystemRoot") + L"\\System32\\tar.exe";
+    if (Exists(tar)) {
+        Line(L"Downloading Python 3.12 (about 15 MB)...");
+        if (Download(PY_ZIP_URL, zip)) {
+            Line(L"Unpacking...");
+            CreateDirectoryW(stage.c_str(), nullptr);
+            int rc = Run(Q(tar) + L" -xf " + Q(zip) + L" -C " + Q(stage));
+            DeleteFileW(zip.c_str());
+            if (rc == 0 && PythonWorks(py)) return py;
+            Line(L"The unpacked Python does not start (code " + std::to_wstring(rc) + L"). Trying the python.org installer instead.");
+        } else {
+            Line(L"Download failed. Trying the python.org installer instead.");
+        }
+    }
+    // fallback: the regular python.org installer (per-user), then look again for whatever got registered
+    std::wstring tmp = Env(L"TEMP") + L"\\voicerecogn-python-setup.exe";
+    Line(L"Downloading the Python installer from python.org (about 25 MB)...");
+    if (!Download(PY_URL, tmp)) { Line(L"Could not download Python. Check your internet connection."); return L""; }
+    std::wstring plog = dir + L"\\python-setup.log";
+    Line(L"Installing Python for the current user...");
+    int rc = Run(Q(tmp) + L" /quiet /log " + Q(plog) + L" InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_test=0"
+                          L" Include_doc=0 Include_tcltk=0 Shortcuts=0 AssociateFiles=0");
+    DeleteFileW(tmp.c_str());
+    std::wstring found = FindPython(dir);
+    if (found.empty()) Line(L"Python setup exit code " + std::to_wstring(rc) + L". Log: " + plog);
+    return found;
+}
+
+// Rough free-space check: the models and CUDA libraries need several GB.
+static void CheckDisk(const std::wstring& dir) {
+    ULARGE_INTEGER freeB{};
+    if (GetDiskFreeSpaceExW(dir.c_str(), &freeB, nullptr, nullptr)) {
+        unsigned long long gb = freeB.QuadPart >> 30;
+        Line(L"Free space on the target drive: " + std::to_wstring(gb) + L" GB (about 8 GB are needed).");
+        if (gb < 8) Fail(L"not enough free disk space on the target drive. Choose another folder and run the installer again.");
+    }
 }
 
 static bool HasNvidia() {
@@ -254,6 +311,7 @@ int wmain() {
     CreateDirectoryW(dir.c_str(), nullptr);
     if (!Exists(dir)) Fail(L"could not create the folder " + dir);
     Line(L"Install folder: " + dir);
+    if (!Exists(dir + L"\\venv\\Scripts\\python.exe")) CheckDisk(dir);
 
     // ---- 2. program files
     Step(L"1/5  Program files");
@@ -276,16 +334,12 @@ int wmain() {
     } else {
         std::wstring py = FindPython(dir);
         if (py.empty()) {
-            Line(L"Python not found - downloading Python 3.12 from python.org (about 25 MB)...");
-            std::wstring tmp = Env(L"TEMP") + L"\\voicerecogn-python-setup.exe";
-            if (!Download(PY_URL, tmp)) Fail(L"could not download Python. Check your internet connection.");
-            Line(L"Installing Python into " + dir + L"\\python ...");
-            int rc = Run(Q(tmp) + L" /quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_test=0"
-                                  L" Include_doc=0 Include_tcltk=0 Shortcuts=0 AssociateFiles=0 TargetDir=" +
-                         Q(dir + L"\\python"));
-            DeleteFileW(tmp.c_str());
-            py = dir + L"\\python\\python.exe";
-            if (rc != 0 || !PythonWorks(py)) Fail(L"the Python installation failed (code " + std::to_wstring(rc) + L").");
+            Line(L"No suitable Python (3.10+ with venv, ssl and pip) found on this PC.");
+            py = InstallPrivatePython(dir);
+            if (py.empty()) {
+                Line(L"Alternative: install Python 3.12 from https://www.python.org/downloads/ yourself, then run this installer again.");
+                Fail(L"could not set up Python.");
+            }
         }
         Line(L"Python: " + py);
         Line(L"Creating the venv environment...");

@@ -1,0 +1,25 @@
+name: macOS build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "mac/**"
+      - "worker.py"
+      - "dl_progress.py"
+      - "requirements.txt"
+      - ".github/workflows/macos.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the app and the disk image
+        run: |
+          chmod +x mac/build.sh
+          ./mac/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceRecognition-macOS
+          path: mac/dist/VoiceRecognition-macOS.dmg

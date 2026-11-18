@@ -75,7 +75,7 @@ def ensure_deps():
     send('S', 'Installing missing Python packages (%s)...' % ', '.join(re.split(r'[<>=!~\[ ;]', m, maxsplit=1)[0] for m in missing))
     cmd = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--progress-bar', 'raw'] + missing
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
-                         errors='replace', creationflags=0x08000000)   # CREATE_NO_WINDOW
+                         errors='replace', creationflags=0x08000000 if os.name == 'nt' else 0)   # CREATE_NO_WINDOW on Windows
     cur, t0, last = '', time.time(), 0.0
     for l in p.stdout:
         l = l.strip()
@@ -126,6 +126,8 @@ except Exception as e:
     sys.stderr.write('model pre-download failed: %r\n' % (e,))
 
 try:
+    if not has_nvidia():
+        raise RuntimeError('no NVIDIA GPU (CPU mode)')
     model = WhisperModel(model_ref, device='cuda', compute_type='int8_float16', download_root=os.path.join(ROOT, 'hf'))
     dev = 'GPU'
 except Exception as e:

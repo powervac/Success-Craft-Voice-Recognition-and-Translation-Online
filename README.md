@@ -167,3 +167,13 @@ Environment variables read by the worker:
 The code in this repository is released under the [MIT License](LICENSE).
 
 Third-party components keep their own licenses: Whisper (MIT), faster-whisper (MIT), CTranslate2 (MIT). **The NLLB-200 translation model is distributed under the CC-BY-NC 4.0 license, i.e. for non-commercial use only** – check the model card before using the app commercially, or swap in another CTranslate2-compatible translation model.
+
+## macOS version
+
+A native macOS app (Swift / AppKit) with the same features as the Windows version lives in [`mac/`](mac). It uses the same `worker.py`.
+
+- **Requirements:** macOS 13 or newer, Apple Silicon (M1 or later) recommended; Intel Macs work but are slower.
+- **Install:** open `VoiceRecognition-macOS.dmg`, drag the app to Applications, right-click it and choose *Open* the first time (the app is not notarized). On the first start it sets itself up: it uses a suitable Python if one is installed, otherwise it downloads a private Python (python-build-standalone) into `~/Library/Application Support/VoiceRecognition`, creates a virtual environment and installs the packages and models (a few GB, internet needed). Nothing is installed system-wide; delete that folder to remove everything.
+- **Sound of the other side (the "Them" channel)** is captured with ScreenCaptureKit, so no virtual audio driver is needed; macOS asks for the "Screen & System Audio Recording" permission. Microphone access is asked for as well.
+- **Speed:** there is no NVIDIA GPU on a Mac, so recognition runs on the CPU with the `small` model (as on a Windows PC without NVIDIA).
+- **Build it yourself:** `./mac/build.sh` on a Mac with the Xcode command line tools produces `mac/dist/VoiceRecognition-macOS.dmg`. The GitHub Actions workflow `macOS build` does the same on a macOS runner.
