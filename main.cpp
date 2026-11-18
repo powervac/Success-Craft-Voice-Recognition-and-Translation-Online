@@ -17,6 +17,7 @@
 #include <mmdeviceapi.h>
 #include <mmreg.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 #include <richedit.h>
 #include <algorithm>
 #include <atomic>
@@ -35,7 +36,7 @@
 enum { ID_MIC = 101, ID_LANG, ID_START, ID_CLEAR, ID_COPY, ID_LEVEL, ID_STATUS, ID_EDIT,
        ID_TGT, ID_SWAP, ID_COPYTR, ID_EDITTR, ID_SAVE,
        ID_GAIN, ID_NSSTR, ID_NS, ID_AGC, ID_BOOST,
-       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL, ID_TRMODEL };
+       ID_SYS, ID_REV, ID_ECHO, ID_ONE, ID_MANY, ID_SENS, ID_LEVEL2, ID_SYSDEV, ID_PROG, ID_MICON, ID_SPKMODEL, ID_TRMODEL, ID_HIST };
 enum { WM_WORKER = WM_APP + 1, WM_LEVEL = WM_APP + 2, WM_SYSERR = WM_APP + 3 };
 
 // language table: code for the worker, label shown in the combos
@@ -47,13 +48,14 @@ static const int NLANGS = sizeof(LANGS) / sizeof(LANGS[0]);
 // ---- settings shared with the audio threads ----
 static std::atomic<int> g_gainDb{0}, g_ns{1}, g_nsStr{50}, g_agc{1}, g_boost{0};
 static std::atomic<int> g_sysOn{0}, g_rev{1}, g_echo{0}, g_diar{0}, g_sens{60}, g_micOn{1};
+static void EndSession();
 static std::atomic<long long> g_sysLastSpeechMs{0};   // for the speaker-echo filter
 
 // ---- window handles and state ----
 static HWND hMain, hMicLbl, hMic, hLang, hStart, hClear, hCopy, hLevel, hLevel2, hStatus, hEdit;
 static HWND hGainLbl, hGain, hGainVal, hAgc, hNs, hNsStr, hNsVal, hBoost;
 static HWND hSysOn, hRev, hEcho, hOne, hMany, hSens, hSensVal;
-static HWND hSysLbl, hSysDev, hProg, hMicOn, hSpkLbl, hSpkModel, hTrmLbl, hTrModel;
+static HWND hSysLbl, hSysDev, hProg, hMicOn, hSpkLbl, hSpkModel, hTrmLbl, hTrModel, hHist, hHistWnd;
 struct SpkModel { std::wstring id, label; int mb = 0; bool present = false; };
 static std::vector<SpkModel> g_spk;             // catalog sent by the worker
 static std::wstring g_spkActive, g_spkWanted;   // model in use / model chosen in the UI
@@ -737,6 +739,7 @@ static void StopLoopback() {
 
 static bool StartCapture(UINT dev) {
     if (!g_micOn && !g_sysOn) return false;          // nothing to listen to
+    EndSession();                                    // a new history session starts with the first utterance
     g_ch[0] = Channel(0);
     if (g_micOn) {                                   // with the microphone switched off it is not even opened
         WAVEFORMATEX wf{WAVE_FORMAT_PCM, 1, 16000, 32000, 2, 16, 0};
@@ -780,6 +783,235 @@ static void StopCapture() {
     SendMessageW(hLevel, PBM_SETPOS, 0, 0);
 }
 
+// =====================================================================================
+//  Session history: every session is a record saved in history\<stamp>.txt
+// =====================================================================================
+static std::wstring ExeDir() {
+    wchar_t e[MAX_PATH];
+    GetModuleFileNameW(nullptr, e, MAX_PATH);
+    std::wstring d = e;
+    return d.substr(0, d.find_last_of(L"\\/"));
+}
+static std::wstring Stamp() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t b[40];
+    swprintf(b, 40, L"%04d-%02d-%02d_%02d-%02d-%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return b;
+}
+
+// ---- session history: history\<stamp>.txt, one line per utterance (UTF-8, tab separated) ----
+static HANDLE g_sess = INVALID_HANDLE_VALUE;
+static std::wstring g_sessPath;
+
+static void EndSession() {
+    if (g_sess != INVALID_HANDLE_VALUE) CloseHandle(g_sess);
+    g_sess = INVALID_HANDLE_VALUE;
+    g_sessPath.clear();
+}
+static std::string CleanU8(const std::wstring& w) {
+    std::wstring c = w;
+    for (auto& ch : c) if (ch == L'\t' || ch == L'\r' || ch == L'\n') ch = L' ';
+    int n = WideCharToMultiByte(CP_UTF8, 0, c.data(), (int)c.size(), nullptr, 0, nullptr, nullptr);
+    std::string u(n, '\0');
+    if (n) WideCharToMultiByte(CP_UTF8, 0, c.data(), (int)c.size(), &u[0], n, nullptr, nullptr);
+    return u;
+}
+static void SessionAppend(const Utt& u) {
+    if (g_sess == INVALID_HANDLE_VALUE) {
+        std::wstring dir = ExeDir() + L"\\history";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        std::wstring stamp = Stamp();
+        g_sessPath = dir + L"\\" + stamp + L".txt";
+        g_sess = CreateFileW(g_sessPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (g_sess == INVALID_HANDLE_VALUE) return;
+        std::string head = "#V1\t" + CleanU8(stamp) + "\n";
+        DWORD w;
+        WriteFile(g_sess, head.data(), (DWORD)head.size(), &w, nullptr);
+    }
+    std::string line = "U\t" + std::to_string(u.ch) + "\t" + std::to_string(u.spk) + "\t" + (u.labeled ? "1" : "0") + "\t" +
+                       u.oLang + "\t" + u.tLang + "\t" + CleanU8(u.orig) + "\t" + CleanU8(u.tr) + "\n";
+    DWORD w;
+    WriteFile(g_sess, line.data(), (DWORD)line.size(), &w, nullptr);
+    FlushFileBuffers(g_sess);                   // the history survives a crash
+}
+
+static std::wstring ReadU8File(const std::wstring& path) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return L"";
+    DWORD sz = GetFileSize(f, nullptr), rd = 0;
+    std::string b(sz, '\0');
+    ReadFile(f, &b[0], sz, &rd, nullptr);
+    CloseHandle(f);
+    b.resize(rd);
+    return Utf8ToW(b);
+}
+static std::vector<std::wstring> SplitOn(const std::wstring& s, wchar_t sep) {
+    std::vector<std::wstring> r;
+    size_t st = 0, q;
+    while ((q = s.find(sep, st)) != std::wstring::npos) { r.push_back(s.substr(st, q - st)); st = q + 1; }
+    r.push_back(s.substr(st));
+    return r;
+}
+static bool ParseUtt(const std::wstring& line, Utt& u) {
+    auto f = SplitOn(line, L'\t');
+    if (f.size() < 8 || f[0] != L"U") return false;
+    u.ch = _wtoi(f[1].c_str()) & 1;
+    u.spk = _wtoi(f[2].c_str());
+    u.labeled = f[3] == L"1";
+    u.oLang = std::string(f[4].begin(), f[4].end());
+    u.tLang = std::string(f[5].begin(), f[5].end());
+    u.orig = f[6];
+    u.tr = f[7];
+    return true;
+}
+
+struct HistSession { std::wstring path, stamp, first; int lines = 0; };
+static std::vector<HistSession> g_hs;
+
+static HistSession ScanSession(const std::wstring& path) {
+    HistSession h;
+    h.path = path;
+    for (auto& raw : SplitOn(ReadU8File(path), L'\n')) {
+        std::wstring ln = raw;
+        if (!ln.empty() && ln.back() == L'\r') ln.pop_back();
+        if (ln.rfind(L"#V1", 0) == 0) {
+            auto f = SplitOn(ln, L'\t');
+            if (f.size() > 1) h.stamp = f[1];
+            continue;
+        }
+        Utt u;
+        if (ParseUtt(ln, u)) {
+            if (h.lines++ == 0) h.first = u.orig.substr(0, 70);
+        }
+    }
+    if (h.stamp.empty()) { auto nm = path.substr(path.find_last_of(L"\\/") + 1); h.stamp = nm.substr(0, nm.find_last_of(L'.')); }
+    return h;
+}
+
+static void LoadSession(const std::wstring& path) {
+    PaneClear(g_src); PaneClear(g_tr);
+    g_utts.clear(); g_await[0].clear(); g_await[1].clear();
+    EndSession();                                // new speech goes to a new session
+    int n = 0;
+    for (auto& raw : SplitOn(ReadU8File(path), L'\n')) {
+        std::wstring ln = raw;
+        if (!ln.empty() && ln.back() == L'\r') ln.pop_back();
+        Utt u;
+        if (!ParseUtt(ln, u)) continue;
+        g_utts.push_back(u);
+        PaneCommit(g_src, Entry{u.ch, u.spk, u.labeled, u.orig});
+        if (!u.tr.empty()) PaneCommit(g_tr, Entry{u.ch, u.spk, u.labeled, u.tr});
+        n++;
+    }
+    SetStatus(L"Loaded a session from the history (" + std::to_wstring(n) + L" lines).");
+}
+
+static std::wstring SessionPreview(const HistSession& h) {
+    std::wstring r = L"Started: " + h.stamp + L"\r\n";
+    r += L"\r\n";
+    for (auto& raw : SplitOn(ReadU8File(h.path), L'\n')) {
+        std::wstring ln = raw;
+        if (!ln.empty() && ln.back() == L'\r') ln.pop_back();
+        Utt u;
+        if (!ParseUtt(ln, u)) continue;
+        r += (u.labeled ? L"[" + LabelOf(u.ch, u.spk) + L"] " : L"") + u.orig + L"\r\n";
+        if (!u.tr.empty()) r += L"      \u2192 " + u.tr + L"\r\n";
+    }
+    return r;
+}
+
+// ---- the History window ----
+enum { HID_LIST = 301, HID_PREV, HID_LOAD, HID_DEL, HID_FOLDER, HID_CLOSE };
+static HWND hhList, hhPrev, hhLoad, hhDel, hhFolder, hhClose;
+
+static void HistRefresh() {
+    g_hs.clear();
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((ExeDir() + L"\\history\\*.txt").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { g_hs.push_back(ScanSession(ExeDir() + L"\\history\\" + fd.cFileName)); } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(g_hs.begin(), g_hs.end(), [](const HistSession& a, const HistSession& b) { return a.stamp > b.stamp; });
+    SendMessageW(hhList, LB_RESETCONTENT, 0, 0);
+    for (auto& s : g_hs) {
+        std::wstring t = s.stamp + L"   (" + std::to_wstring(s.lines) + L" lines)" + L"   " + s.first;
+        SendMessageW(hhList, LB_ADDSTRING, 0, (LPARAM)t.c_str());
+    }
+    if (!g_hs.empty()) SendMessageW(hhList, LB_SETCURSEL, 0, 0);
+    SetWindowTextW(hhPrev, g_hs.empty() ? L"No saved sessions yet. Every session is saved here automatically while you listen." : SessionPreview(g_hs[0]).c_str());
+}
+
+static void OpenFolder(const std::wstring& name) {
+    std::wstring dir = ExeDir() + L"\\" + name;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static LRESULT CALLBACK HistProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int id, DWORD ex = 0) {
+            HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, 0, 0, 10, 10, hw, (HMENU)(INT_PTR)id, nullptr, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)hFont, TRUE);
+            return c;
+        };
+        hhList = mk(L"LISTBOX", L"", LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP, HID_LIST, WS_EX_CLIENTEDGE);
+        hhPrev = mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, HID_PREV, WS_EX_CLIENTEDGE);
+        hhLoad = mk(L"BUTTON", L"Load into the window", BS_PUSHBUTTON | WS_TABSTOP, HID_LOAD);
+        hhDel = mk(L"BUTTON", L"Delete", BS_PUSHBUTTON | WS_TABSTOP, HID_DEL);
+        hhFolder = mk(L"BUTTON", L"Open history folder", BS_PUSHBUTTON | WS_TABSTOP, HID_FOLDER);
+        hhClose = mk(L"BUTTON", L"Close", BS_PUSHBUTTON | WS_TABSTOP, HID_CLOSE);
+        HistRefresh();
+        return 0;
+    }
+    case WM_SIZE: {
+        int w = LOWORD(lp), h = HIWORD(lp), m = S(10), bh = S(30), lw = std::max(S(260), w * 38 / 100);
+        MoveWindow(hhList, m, m, lw, h - 3 * m - bh, TRUE);
+        MoveWindow(hhPrev, 2 * m + lw, m, w - 3 * m - lw, h - 3 * m - bh, TRUE);
+        int y = h - m - bh, x = m;
+        MoveWindow(hhLoad, x, y, S(170), bh, TRUE); x += S(180);
+        MoveWindow(hhDel, x, y, S(90), bh, TRUE); x += S(100);
+        MoveWindow(hhFolder, x, y, S(170), bh, TRUE);
+        MoveWindow(hhClose, w - m - S(90), y, S(90), bh, TRUE);
+        return 0;
+    }
+    case WM_GETMINMAXINFO: { auto* mm = (MINMAXINFO*)lp; mm->ptMinTrackSize = {S(820), S(420)}; return 0; }
+    case WM_COMMAND: {
+        int sel = (int)SendMessageW(hhList, LB_GETCURSEL, 0, 0);
+        bool ok = sel >= 0 && sel < (int)g_hs.size();
+        switch (LOWORD(wp)) {
+        case HID_LIST:
+            if (HIWORD(wp) == LBN_SELCHANGE && ok) SetWindowTextW(hhPrev, SessionPreview(g_hs[sel]).c_str());
+            if (HIWORD(wp) == LBN_DBLCLK && ok) { LoadSession(g_hs[sel].path); DestroyWindow(hw); }
+            return 0;
+        case HID_LOAD: if (ok) { LoadSession(g_hs[sel].path); DestroyWindow(hw); } return 0;
+        case HID_DEL:
+            if (ok && MessageBoxW(hw, L"Delete this session from the history?\n(Audio recordings are not deleted.)", L"History",
+                                  MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                if (g_hs[sel].path == g_sessPath) EndSession();
+                DeleteFileW(g_hs[sel].path.c_str());
+                HistRefresh();
+            }
+            return 0;
+        case HID_FOLDER: OpenFolder(L"history"); return 0;
+        case HID_CLOSE: DestroyWindow(hw); return 0;
+        }
+        break;
+    }
+    case WM_CLOSE: DestroyWindow(hw); return 0;
+    case WM_DESTROY: hHistWnd = nullptr; return 0;
+    }
+    return DefWindowProcW(hw, msg, wp, lp);
+}
+
+static void OpenHistory() {
+    if (hHistWnd) { ShowWindow(hHistWnd, SW_RESTORE); SetForegroundWindow(hHistWnd); HistRefresh(); return; }
+    hHistWnd = CreateWindowExW(WS_EX_TOPMOST, L"VoiceHistory", L"History", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+                               S(920), S(580), hMain, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
 static void UpdateUi() {
     bool on = g_capturing;
     SetWindowTextW(hStart, on ? L"Stop" : L"Start");
@@ -814,10 +1046,11 @@ static void Layout(int w, int h) {
     int bw = S(90), bh = rowH + S(2);
     MoveWindow(hStart, m, y, bw, bh, TRUE);
     MoveWindow(hClear, m + bw + m, y, bw, bh, TRUE);
-    MoveWindow(hCopy, m + 2 * (bw + m), y, S(165), bh, TRUE);
-    MoveWindow(hCopyTr, m + 2 * (bw + m) + S(165) + m, y, S(165), bh, TRUE);
-    MoveWindow(hSave, m + 2 * (bw + m) + 2 * (S(165) + m), y, bw + S(20), bh, TRUE);
-    int lx = m + 2 * (bw + m) + 2 * (S(165) + m) + bw + S(20) + m;
+    MoveWindow(hCopy, m + 2 * (bw + m), y, S(150), bh, TRUE);
+    MoveWindow(hCopyTr, m + 2 * (bw + m) + S(150) + m, y, S(160), bh, TRUE);
+    MoveWindow(hSave, m + 2 * (bw + m) + S(150) + S(160) + 2 * m, y, bw + S(10), bh, TRUE);
+    MoveWindow(hHist, m + 2 * (bw + m) + S(150) + S(160) + 3 * m + bw + S(10), y, S(110), bh, TRUE);
+    int lx = m + 2 * (bw + m) + S(150) + S(160) + 4 * m + bw + S(10) + S(110);
     MoveWindow(hLevel, lx, y + S(3), std::max(S(40), w - m - lx), S(10), TRUE);
     MoveWindow(hLevel2, lx, y + S(16), std::max(S(40), w - m - lx), S(10), TRUE);
     y += bh + m;
@@ -1004,6 +1237,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         hCopy = Mk(L"BUTTON", L"Copy text", BS_PUSHBUTTON | WS_TABSTOP, ID_COPY);
         hCopyTr = Mk(L"BUTTON", L"Copy translation", BS_PUSHBUTTON | WS_TABSTOP, ID_COPYTR);
         hSave = Mk(L"BUTTON", L"Save...", BS_PUSHBUTTON | WS_TABSTOP, ID_SAVE);
+        hHist = Mk(L"BUTTON", L"History...", BS_PUSHBUTTON | WS_TABSTOP, ID_HIST);
         hLevel = Mk(PROGRESS_CLASSW, L"", 0, ID_LEVEL);
         hLevel2 = Mk(PROGRESS_CLASSW, L"", 0, ID_LEVEL2);
         SendMessageW(hLevel, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
@@ -1147,9 +1381,12 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_CLEAR:
             PaneClear(g_src); PaneClear(g_tr);
             g_utts.clear(); g_await[0].clear(); g_await[1].clear();
+            EndSession();                    // the next speech is a new history session
             SendFrame('R', nullptr, 0);      // new conversation: forget the known voices
             return 0;
         case ID_SAVE: SaveDocuments(hw); return 0;
+        case ID_HIST: OpenHistory(); return 0;
+
         case ID_NS: case ID_AGC: case ID_BOOST: UpdateFx(true); return 0;
         case ID_REV: case ID_ECHO: case ID_ONE: case ID_MANY: UpdateConv(true); return 0;
         case ID_MICON: {   // switch the microphone on/off (e.g. to avoid pick-up of loudspeakers)
@@ -1343,10 +1580,13 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         case 'U': {
             int idx = -1;
             if (!g_await[ch].empty()) { idx = g_await[ch].front(); g_await[ch].pop_front(); }
-            if (idx >= 0 && idx < (int)g_utts.size() && !m->text.empty()) {
-                g_utts[idx].tr = m->text;
-                g_utts[idx].tLang = m->lang;
-                PaneCommit(g_tr, Entry{ch, g_utts[idx].spk, g_utts[idx].labeled, m->text});
+            if (idx >= 0 && idx < (int)g_utts.size()) {
+                if (!m->text.empty()) {
+                    g_utts[idx].tr = m->text;
+                    g_utts[idx].tLang = m->lang;
+                    PaneCommit(g_tr, Entry{ch, g_utts[idx].spk, g_utts[idx].labeled, m->text});
+                } else PaneClearLive(g_tr, ch);
+                SessionAppend(g_utts[idx]);              // the finished utterance goes to the history file
             } else PaneClearLive(g_tr, ch);
             break;
         }
@@ -1361,6 +1601,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
         if (g_capturing) StopCapture();
+        EndSession();
         SendFrame('Q', nullptr, 0);
         if (hJob) CloseHandle(hJob);  // kills python tree
         PostQuitMessage(0);
@@ -1380,6 +1621,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"VoiceWindow";
     RegisterClassW(&wc);
+    WNDCLASSW hc{};
+    hc.lpfnWndProc = HistProc;
+    hc.hInstance = hInst;
+    hc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    hc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    hc.lpszClassName = L"VoiceHistory";
+    RegisterClassW(&hc);
     HDC dc = GetDC(nullptr); int dpi = GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(nullptr, dc);
     // WS_EX_TOPMOST: always above other windows; it leaves only when minimized with the "-" button
     HWND w = CreateWindowExW(WS_EX_TOPMOST, L"VoiceWindow", L"Voice Recognition and Translation", WS_OVERLAPPEDWINDOW,

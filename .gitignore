@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 # downloaded C++ toolchain (install_and_build.bat)
 tools/
+# user data: session history (one file per session)
+history/

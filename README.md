@@ -44,6 +44,7 @@ Pick a microphone, choose the spoken language and the target language (for examp
   - noise suppression (high-pass filter + adaptive noise gate) with an adjustable strength.
 - **Robust speech detection:** an adaptive energy detector with hysteresis; its noise floor cannot be dragged upwards by quiet speech, so the app does not "go deaf" during long sessions. The status line shows whether speech is currently detected.
 - **Always on top:** the window stays above all other windows and hides only when you minimize it.
+- **History:** every session is saved automatically as a record (date, every line with its speaker label and translation) in the `history` folder next to the program. The **History...** button lists the sessions, shows a preview, loads one back into the window, or deletes it. The folder stays on your computer and is not part of the repository.
 - **Save to disk:** writes both versions of the document, for example `Transcript_2026-11-17_17-11_en.txt` and `Transcript_2026-11-17_17-11_ru.txt` (UTF-8). **Copy** buttons place either panel on the clipboard.
 - All settings (microphone, languages, sliders, checkboxes) are remembered between runs.
 - **Self-installing:** on every start the app checks what is missing and installs it - Python (via winget, if none is found), the virtual environment, the Python packages from `requirements.txt` (only the missing ones; CUDA libraries only when an NVIDIA GPU is present) and the models. Downloads show a progress bar with percent, size and the estimated time left.
