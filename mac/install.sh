@@ -6,8 +6,8 @@
 # Uninstall:  rm -rf "/Applications/Voice Recognition.app" ~/.local/bin/voice-recognition ~/Library/Application\ Support/VoiceRecognition
 set -euo pipefail
 
-VERSION="${VOICE_VERSION:-1.0.0}"
-SHA256="${VOICE_SHA256:-eecbc4744416ad4d9c7d38cdba668426fae634bbbe83f2f4a12e9621ac7ab8d7}"
+VERSION="${VOICE_VERSION:-1.0.1}"
+SHA256="${VOICE_SHA256:-ee9909c53c75c6ab68a709a69cf51e0a01acd202a0afa9722f685cc591548ca5}"
 URL="${VOICE_URL:-https://github.com/powervac/Success-Craft-Voice-Recognition-and-Translation-Online/releases/download/macos-v${VERSION}/VoiceRecognition-macOS.dmg}"
 APP_NAME="Voice Recognition.app"
 

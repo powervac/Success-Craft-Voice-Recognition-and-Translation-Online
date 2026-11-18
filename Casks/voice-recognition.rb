@@ -1,6 +1,6 @@
 cask "voice-recognition" do
-  version "1.0.0"
-  sha256 "eecbc4744416ad4d9c7d38cdba668426fae634bbbe83f2f4a12e9621ac7ab8d7"
+  version "1.0.1"
+  sha256 "ee9909c53c75c6ab68a709a69cf51e0a01acd202a0afa9722f685cc591548ca5"
 
   url "https://github.com/powervac/Success-Craft-Voice-Recognition-and-Translation-Online/releases/download/macos-v#{version}/VoiceRecognition-macOS.dmg"
   name "Voice Recognition and Translation"
