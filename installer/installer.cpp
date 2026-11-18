@@ -33,7 +33,7 @@ static void Step(const std::wstring& s) { Line(); Line(L"===== " + s + L" ====="
 
 static void WaitEnter() {
     Line();
-    Out(L"Нажмите Enter, чтобы закрыть окно...");
+    Out(L"Press Enter to close this window...");
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     FlushConsoleInputBuffer(in);
     wchar_t b[16];
@@ -43,8 +43,8 @@ static void WaitEnter() {
 
 [[noreturn]] static void Fail(const std::wstring& s) {
     Line();
-    Line(L"ОШИБКА: " + s);
-    Line(L"Установка не завершена. Запустите установщик ещё раз - уже сделанные шаги будут пропущены.");
+    Line(L"ERROR: " + s);
+    Line(L"The installation is not finished. Run the installer again - the steps that are already done are skipped.");
     WaitEnter();
     ExitProcess(1);
 }
@@ -57,7 +57,7 @@ static bool Ask(const std::wstring& q) {
     DWORD r = 0;
     ReadConsoleW(in, b, 15, &r, nullptr);
     wchar_t c = b[0];
-    return !(c == L'n' || c == L'N' || c == L'н' || c == L'Н');
+    return !(c == L'n' || c == L'N' || c == L'\u043d' || c == L'\u041d');
 }
 
 // ---------------------------------------------------------------- helpers
@@ -133,7 +133,7 @@ public:
             if (pct != last_) {
                 last_ = pct;
                 Out(L"\r  " + std::to_wstring(pct) + L"%  (" + std::to_wstring(done / 1048576) + L" / " +
-                    std::to_wstring(total / 1048576) + L" МБ)   ");
+                    std::to_wstring(total / 1048576) + L" MB)   ");
             }
         }
         return S_OK;
@@ -173,8 +173,8 @@ static std::wstring PickFolder() {
     DWORD opts = 0;
     dlg->GetOptions(&opts);
     dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    dlg->SetTitle(L"Куда установить Voice Recognition? (будет создана папка VoiceRecognition)");
-    dlg->SetOkButtonLabel(L"Установить сюда");
+    dlg->SetTitle(L"Where to install Voice Recognition? (a folder named VoiceRecognition is created)");
+    dlg->SetOkButtonLabel(L"Install here");
     if (SUCCEEDED(dlg->Show(GetConsoleWindow()))) {
         IShellItem* item = nullptr;
         if (SUCCEEDED(dlg->GetResult(&item))) {
@@ -205,7 +205,7 @@ static void MakeShortcut(const std::wstring& target, const std::wstring& workDir
     if (SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf)))) {
         pf->Save(lnk.c_str(), TRUE);
         pf->Release();
-        Line(L"Ярлык на рабочем столе: Voice Recognition");
+        Line(L"Desktop shortcut: Voice Recognition");
     }
     sl->Release();
 }
@@ -236,15 +236,15 @@ static bool HasNvidia() {
 
 // ---------------------------------------------------------------- main
 int wmain() {
-    SetConsoleTitleW(L"Voice Recognition - установка");
+    SetConsoleTitleW(L"Voice Recognition - setup");
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    Line(L"Voice Recognition and Translation - установщик");
-    Line(L"Сейчас откроется окно выбора папки.");
+    Line(L"Voice Recognition and Translation - setup");
+    Line(L"A folder picker opens now.");
 
     // ---- 1. folder
     std::wstring parent = PickFolder();
-    if (parent.empty()) Fail(L"папка не выбрана.");
+    if (parent.empty()) Fail(L"no folder was chosen.");
     while (!parent.empty() && (parent.back() == L'\\' || parent.back() == L'/')) parent.pop_back();
     std::wstring dir = parent;
     {
@@ -252,19 +252,19 @@ int wmain() {
         if (lstrcmpiW(tail.c_str(), L"VoiceRecognition") != 0) dir += L"\\VoiceRecognition";
     }
     CreateDirectoryW(dir.c_str(), nullptr);
-    if (!Exists(dir)) Fail(L"не удалось создать папку " + dir);
-    Line(L"Папка установки: " + dir);
+    if (!Exists(dir)) Fail(L"could not create the folder " + dir);
+    Line(L"Install folder: " + dir);
 
     // ---- 2. program files
-    Step(L"1/5  Файлы программы");
+    Step(L"1/5  Program files");
     struct { const wchar_t* res; const wchar_t* name; } files[] = {
         {L"F_EXE", L"VoiceWindow.exe"},       {L"F_WORKER", L"worker.py"},
         {L"F_DLPROG", L"dl_progress.py"},     {L"F_REQ", L"requirements.txt"},
         {L"F_MODELS", L"install_models.py"},  {L"F_README", L"README.md"},
     };
     for (auto& f : files) {
-        if (!Extract(f.res, dir + L"\\" + f.name)) Fail(std::wstring(L"не удалось записать ") + f.name +
-                                                        L" (программа запущена? закройте VoiceWindow.exe)");
+        if (!Extract(f.res, dir + L"\\" + f.name)) Fail(std::wstring(L"could not write ") + f.name +
+                                                        L" (is the program running? close VoiceWindow.exe)");
         Line(std::wstring(L"  ") + f.name);
     }
 
@@ -272,31 +272,31 @@ int wmain() {
     Step(L"2/5  Python");
     std::wstring venvPy = dir + L"\\venv\\Scripts\\python.exe";
     if (Exists(venvPy) && PythonWorks(venvPy)) {
-        Line(L"Окружение Python уже есть, пропускаю.");
+        Line(L"The Python environment already exists, skipping.");
     } else {
         std::wstring py = FindPython(dir);
         if (py.empty()) {
-            Line(L"Python не найден - скачиваю Python 3.12 с python.org (около 25 МБ)...");
+            Line(L"Python not found - downloading Python 3.12 from python.org (about 25 MB)...");
             std::wstring tmp = Env(L"TEMP") + L"\\voicerecogn-python-setup.exe";
-            if (!Download(PY_URL, tmp)) Fail(L"не удалось скачать Python. Проверьте интернет.");
-            Line(L"Устанавливаю Python в " + dir + L"\\python ...");
+            if (!Download(PY_URL, tmp)) Fail(L"could not download Python. Check your internet connection.");
+            Line(L"Installing Python into " + dir + L"\\python ...");
             int rc = Run(Q(tmp) + L" /quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_test=0"
                                   L" Include_doc=0 Include_tcltk=0 Shortcuts=0 AssociateFiles=0 TargetDir=" +
                          Q(dir + L"\\python"));
             DeleteFileW(tmp.c_str());
             py = dir + L"\\python\\python.exe";
-            if (rc != 0 || !PythonWorks(py)) Fail(L"установка Python не удалась (код " + std::to_wstring(rc) + L").");
+            if (rc != 0 || !PythonWorks(py)) Fail(L"the Python installation failed (code " + std::to_wstring(rc) + L").");
         }
         Line(L"Python: " + py);
-        Line(L"Создаю окружение venv...");
-        if (Run(Q(py) + L" -m venv " + Q(dir + L"\\venv")) != 0 || !Exists(venvPy)) Fail(L"не удалось создать venv.");
+        Line(L"Creating the venv environment...");
+        if (Run(Q(py) + L" -m venv " + Q(dir + L"\\venv")) != 0 || !Exists(venvPy)) Fail(L"could not create the venv.");
     }
 
     // ---- 4. packages
-    Step(L"3/5  Пакеты Python");
+    Step(L"3/5  Python packages");
     bool gpu = HasNvidia();
-    Line(gpu ? L"Найдена видеокарта NVIDIA - ставлю всё, включая CUDA-библиотеки."
-             : L"Видеокарта NVIDIA не найдена - ставлю без CUDA-библиотек (работа на процессоре).");
+    Line(gpu ? L"NVIDIA video card found - installing everything, including the CUDA libraries."
+             : L"No NVIDIA video card found - installing without the CUDA libraries (runs on the processor).");
     Run(Q(venvPy) + L" -m pip install --disable-pip-version-check --upgrade pip");
     {
         // requirements.txt without the nvidia-* lines when there is no NVIDIA GPU
@@ -320,22 +320,22 @@ int wmain() {
             req = tmpReq;
         }
         if (Run(Q(venvPy) + L" -m pip install --disable-pip-version-check -r " + Q(req)) != 0)
-            Fail(L"pip не смог установить пакеты (см. сообщения выше).");
+            Fail(L"pip could not install the packages (see the messages above).");
     }
 
     // ---- 5. models
-    Step(L"4/5  Модели");
-    Line(gpu ? L"Распознавание: Whisper large-v3 (~3 ГБ), перевод: NLLB-200 (~1.4 ГБ)."
-             : L"Распознавание: Whisper small (~0.5 ГБ), перевод: NLLB-200 (~1.4 ГБ).");
+    Step(L"4/5  Models");
+    Line(gpu ? L"Recognition: Whisper large-v3 (~3 GB), translation: NLLB-200 (~1.4 GB)."
+             : L"Recognition: Whisper small (~0.5 GB), translation: NLLB-200 (~1.4 GB).");
     if (Run(Q(venvPy) + L" -u " + Q(dir + L"\\install_models.py") + (gpu ? L" --gpu" : L""), dir) != 0)
-        Fail(L"не удалось скачать модели (см. сообщения выше).");
+        Fail(L"could not download the models (see the messages above).");
 
     // ---- 6. shortcut + start
-    Step(L"5/5  Готово");
+    Step(L"5/5  Done");
     MakeShortcut(dir + L"\\VoiceWindow.exe", dir);
-    Line(L"Программа установлена в " + dir);
+    Line(L"The program is installed in " + dir);
     Line();
-    if (Ask(L"Запустить Voice Recognition сейчас?"))
+    if (Ask(L"Start Voice Recognition now?"))
         ShellExecuteW(nullptr, L"open", (dir + L"\\VoiceWindow.exe").c_str(), nullptr, dir.c_str(), SW_SHOWNORMAL);
     CoUninitialize();
     return 0;
