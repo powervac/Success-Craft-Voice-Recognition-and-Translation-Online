@@ -18,6 +18,7 @@ cp "$BIN" "$APP/Contents/MacOS/VoiceRecognition"
 echo "== bundle"
 cp Info.plist "$APP/Contents/Info.plist"
 cp "$ROOT/worker.py" "$ROOT/dl_progress.py" "$ROOT/requirements.txt" "$APP/Contents/Resources/"
+cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 echo "== signing (ad-hoc: no Apple Developer account needed; Gatekeeper still asks on the first start)"
 codesign --force --deep --sign - --entitlements VoiceRecognition.entitlements "$APP"

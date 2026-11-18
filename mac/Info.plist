@@ -4,6 +4,7 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleExecutable</key><string>VoiceRecognition</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleIdentifier</key><string>com.successcraft.voicerecognition</string>
     <key>CFBundleName</key><string>Voice Recognition</string>
     <key>CFBundleDisplayName</key><string>Voice Recognition and Translation</string>

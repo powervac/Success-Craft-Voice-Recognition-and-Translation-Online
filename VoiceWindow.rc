@@ -1,6 +1,7 @@
 // Version information and manifest of VoiceWindow.exe (shown in the file properties, and used by Windows and
 // antivirus programs to recognize a normal, identifiable program).
 1 24 "VoiceWindow.manifest"
+1 ICON "assets/icon.ico"
 
 1 VERSIONINFO
  FILEVERSION 1,0,0,0
